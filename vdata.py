@@ -98,23 +98,29 @@ class OphNetSurgicalDataset(Dataset):
         Returns:
             dict:
                 - 'image': 前処理済み画像 (torch.Tensor)
-                - 'mask': マスク画像 (torch.Tensor)
+                - 'mask': マスク画像 (torch.Tensor) or None
                 - 'label': one-hotラベル (torch.Tensor)
         """
         try:
-            # ランダムに1ウィンドウ選択
+            # ウィンドウ選択
             window = self.chunks[idx]
-            mask_window = self.mask_chunks[idx]
 
-            # 画像平均化とマスク生成
+            # 画像平均化
             img = window.mean(axis=0).astype(np.uint8)
-            mask = img.copy()
 
             # 画像前処理
-            img = cv2.resize(img, (224,224))
-            mask = cv2.resize(mask, (224,224))
-            img = img.transpose(2,0,1) / 255.0
-            mask = mask.transpose(2,0,1)
+            img = cv2.resize(img, (224, 224))
+            img = img.transpose(2, 0, 1) / 255.0
+
+            # マスク処理（マスクがある場合のみ）
+            if self.mask_chunks is not None:
+                mask_window = self.mask_chunks[idx]
+                mask = mask_window.mean(axis=0).astype(np.uint8)
+                mask = cv2.resize(mask, (224, 224))
+                mask = mask.transpose(2, 0, 1)
+            else:
+                # マスクがない場合は画像をそのまま使用
+                mask = img.copy()
 
             # one-hotラベル
             label = self.labels[idx]
@@ -185,7 +191,9 @@ class OphNetSurgicalDataset(Dataset):
                 ret, frame = cap.read()
                 if not ret:
                     break
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                # フレームを320x240にリサイズ
+                frame = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (320, 240))
+                frames.append(frame)
                 frame_count += 1
                 if max_frames and frame_count >= max_frames:
                     logging.debug(f"指定フレーム数 {max_frames} の読み込みが完了しました")
@@ -198,17 +206,21 @@ class OphNetSurgicalDataset(Dataset):
 
         logging.debug(f"読み込んだフレーム数: {len(frames)}")
 
-        if skip_generate_masks:
-            # マスクとして画像をそのまま使用
-            mask_frames = [np.stack([f, f], axis=0) for f in frames]
-            logging.debug("マスク生成をスキップし、画像をそのまま使用します")
-        else:
-            # マスク生成（ここでは単純にフレームを2倍にしてマスクとする）
+        mask_frames = None
+        if not skip_generate_masks:
+            # マスク生成（実際のマスク生成ロジックをここに実装）
             mask_frames = frames.copy()
+            logging.debug("マスク生成を実行します")
+        else:
+            logging.debug("マスク生成をスキップします")
 
         # スライディングウィンドウ抽出
         sw_extractor = SlidingWindowExtractor(window_size, stride)
-        windows, mask_windows = sw_extractor.extract_windows(frames, mask_frames)
+        if mask_frames is not None:
+            windows, mask_windows = sw_extractor.extract_windows(frames, mask_frames)
+        else:
+            windows = sw_extractor.extract_windows(frames)
+            mask_windows = None
 
         logging.debug(f"生成されたウィンドウ数: {len(windows)}")
 
