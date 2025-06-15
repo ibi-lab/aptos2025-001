@@ -1,22 +1,54 @@
 # OphNet手術フェーズ分類器
 
-手術動画から手術フェーズを分類するためのPyTorchベースの実装です。動画データから特徴量を抽出し、Transformerベースのモデルで分類を行います。
+OphNet手術フェーズ分類器は、手術動画のフレームから手術フェーズを自動的に分類するための高度な機械学習システムです。このシステムは、手術映像からフレームを抽出し、maxvit_large_tf_224.in21kモデルを使用して深層特徴量を抽出、それらをTransformerベースのニューラルネットワークで処理することで、手術の各時点におけるフェーズを高精度に分類します。
 
-## プロジェクト概要
+## システムの特徴
 
-### 機能
+1. 効率的なデータ処理：スライディングウィンドウアプローチにより、時系列データの文脈を考慮した特徴抽出を実現。並列処理による高速なデータ処理とメモリ効率の最適化を実現しています。
 
-1. データ処理 (`vdata.py`)
-   - 手術動画からの画像・マスク抽出
-   - 特徴量抽出（maxvit_large_tf_224.in21k）
-   - スライディングウィンドウによるフレーム処理
-   - 中間データの保存（.npz形式）
+2. 柔軟なアーキテクチャ：PyTorchとPyTorch Lightningを基盤とし、マルチGPU環境での分散学習をサポート。CPU環境でも動作可能な適応性の高い設計となっています。
 
-2. モデル学習 (`train.py`)
-   - Transformerベースの特徴量分類器
-   - PyTorch Lightningによる学習管理
-   - Weights & Biasesによる実験管理
-   - マルチGPUサポート
+3. 包括的な実験管理：Weights & Biasesによる実験追跡、TensorBoardによる視覚化、CSVログによるローカルデータ保存など、多様なモニタリングツールを統合しています。
+
+4. 実用的な可視化機能：データセットの統計分析、モデルの予測結果の可視化、中間特徴量の検証など、様々な分析ツールを提供します。
+
+本システムは、医療現場での手術ワークフロー分析や手術支援システムの開発に活用できる、拡張性と保守性を重視した実装となっています。
+
+## 処理フロー
+
+```mermaid
+graph TD
+    subgraph "データ準備 (vdata.py)"
+        A[動画ファイル] --> B[メタ情報抽出]
+        B --> C[フレーム抽出]
+        C --> D[ウィンドウ化]
+        D --> E[特徴量抽出]
+        E --> F[npzファイル保存]
+    end
+
+    subgraph "学習 (train.py)"
+        F --> G[npzファイル読み込み]
+        G --> H[データセット分割]
+        H --> I[Transformerモデル構築]
+        I --> J[PyTorch Lightning学習]
+        J --> K[モデル保存]
+        J --> L[ログ記録]
+    end
+```
+
+## コンポーネント概要
+
+### 1. データ処理 (`vdata.py`)
+- 手術動画からの画像・マスク抽出
+- 特徴量抽出（maxvit_large_tf_224.in21k）
+- スライディングウィンドウによるフレーム処理
+- 中間データの保存（.npz形式）
+
+### 2. モデル学習 (`train.py`)
+- Transformerベースの特徴量分類器
+- PyTorch Lightningによる学習管理
+- Weights & Biasesによる実験管理
+- マルチGPUサポート
 
 3. 可視化・分析 (`view.py`)
    - 画像・マスクの可視化
@@ -97,13 +129,48 @@ python view.py show-features-from-npz ./vdata_mediate/case_001.npz
 抽出した特徴量を使用してモデルを学習します。
 
 ```bash
+# Weights & Biases を使用する場合
 python train.py \
   --npz_dir ./vdata_mediate \
   --output_dir ./models \
   --batch_size 32 \
   --max_epochs 100 \
   --feature_dim 1024 \
-  --learning_rate 1e-4
+  --learning_rate 1e-4 \
+  --gpus "0" \
+  --use_wandb \
+  --wandb_project "my-project" \
+  --wandb_run_name "experiment-1"
+
+# ローカルログのみを使用する場合
+python train.py \
+  --npz_dir ./vdata_mediate \
+  --output_dir ./models \
+  --batch_size 32 \
+  --max_epochs 100 \
+  --feature_dim 1024 \
+  --learning_rate 1e-4 \
+  --gpus "0"
+
+# 複数GPU使用の場合（DDPモード）
+python train.py \
+  --npz_dir ./vdata_mediate \
+  --output_dir ./models \
+  --batch_size 32 \
+  --max_epochs 100 \
+  --feature_dim 1024 \
+  --learning_rate 1e-4 \
+  --gpus "0,1"
+
+# CPU使用の場合
+python train.py \
+  --npz_dir ./vdata_mediate \
+  --output_dir ./models \
+  --batch_size 32 \
+  --max_epochs 100 \
+  --feature_dim 1024 \
+  --learning_rate 1e-4 \
+  --device "cpu"
 ```
 
 主なオプション：

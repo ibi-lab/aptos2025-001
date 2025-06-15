@@ -1,19 +1,26 @@
 import os
-import pandas as pd
-import numpy as np
+import glob
 import torch
-from torch.utils.data import DataLoader, Dataset
-import torch.nn as nn
-import torch.nn.functional as F
 import pytorch_lightning as pl
-import timm
-import click
+import logging
+from tqdm import tqdm
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
 from collections import Counter
 from typing import Optional
-import wandb
+from torch import nn
+import timm
+import click
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning import loggers as pl_loggers
+from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import WandbLogger
 from vdata import OphNetSurgicalDataset, SlidingWindowExtractor
+import torchmetrics
+
+# ログレベルを設定
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- DataModule ---
 class OphNetDataModule(pl.LightningDataModule):
@@ -42,23 +49,42 @@ class OphNetDataModule(pl.LightningDataModule):
             npz_files, test_size=self.val_split, random_state=42
         )
 
-        # データセットの作成
-        self.train_dataset = OphNetSurgicalDataset.load_npz(train_files[0])  # 最初の特徴量を取得してサイズを確認
-        # 残りのデータセットを追加
+        logging.debug(f"Found {len(train_files)} training files and {len(val_files)} validation files")
+
+        # トレーニングデータセットの作成
+        self.train_dataset = OphNetSurgicalDataset.load_npz(train_files[0])
         for npz_file in tqdm(train_files[1:], desc="Loading training datasets"):
             dataset = OphNetSurgicalDataset.load_npz(npz_file)
-            if dataset is not None:
-                self.train_dataset.extend(dataset)
+            # データセットの結合
+            for key in ['features', 'mask_features', 'label']:
+                if hasattr(self.train_dataset, key) and getattr(self.train_dataset, key) is not None:
+                    if hasattr(dataset, key) and getattr(dataset, key) is not None:
+                        setattr(self.train_dataset, key, 
+                               np.concatenate([getattr(self.train_dataset, key), getattr(dataset, key)]))
 
+        # 検証データセットの作成
         self.val_dataset = OphNetSurgicalDataset.load_npz(val_files[0])
         for npz_file in tqdm(val_files[1:], desc="Loading validation datasets"):
             dataset = OphNetSurgicalDataset.load_npz(npz_file)
-            if dataset is not None:
-                self.val_dataset.extend(dataset)
+            # データセットの結合
+            for key in ['features', 'mask_features', 'label']:
+                if hasattr(self.val_dataset, key) and getattr(self.val_dataset, key) is not None:
+                    if hasattr(dataset, key) and getattr(dataset, key) is not None:
+                        setattr(self.val_dataset, key,
+                               np.concatenate([getattr(self.val_dataset, key), getattr(dataset, key)]))
 
         # 特徴量モードを有効化
         self.train_dataset.return_features = True
         self.val_dataset.return_features = True
+
+        logging.debug(f"Training dataset size: {len(self.train_dataset)}")
+        logging.debug(f"Validation dataset size: {len(self.val_dataset)}")
+
+        # データセットが空でないことを確認
+        if len(self.train_dataset) == 0:
+            raise ValueError("Training dataset is empty")
+        if len(self.val_dataset) == 0:
+            raise ValueError("Validation dataset is empty")
 
     def train_dataloader(self):
         return DataLoader(
@@ -167,6 +193,7 @@ class SurgicalPhaseModule(pl.LightningModule):
         self.val_acc = torchmetrics.Accuracy(task='multiclass', num_classes=num_classes)
     
     def forward(self, features, mask_features):
+        # logging.debug(f"features: {features.shape}, mask_features: {mask_features.shape}")
         return self.model(features, mask_features)
     
     def training_step(self, batch, batch_idx):
@@ -182,9 +209,27 @@ class SurgicalPhaseModule(pl.LightningModule):
         preds = torch.argmax(logits, dim=1)
         acc = self.train_acc(preds, labels.argmax(dim=1))
         
-        # WandBへのログ記録
-        self.log('train_loss', loss, on_step=True, on_epoch=True)
-        self.log('train_acc', acc, on_step=True, on_epoch=True)
+        # 現在のバッチの精度を計算
+        batch_acc = (preds == labels.argmax(dim=1)).float().mean()
+        
+        # ログ出力
+        # バッチごとのメトリクス
+        self.log('train/batch_loss', loss, on_step=True, prog_bar=True)
+        self.log('train/batch_acc', batch_acc, on_step=True, prog_bar=True)
+        
+        # エポックごとの累積メトリクス
+        self.log('train/loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train/acc', acc, on_step=False, on_epoch=True, prog_bar=True)
+        
+        # デバッグ出力
+        if batch_idx % 100 == 0:  # 100バッチごとに詳細なログを出力
+            logging.debug(
+                f"Training batch {batch_idx}: "
+                f"loss={loss:.4f}, "
+                f"acc={batch_acc:.4f}, "
+                f"features_shape={features.shape}, "
+                f"mask_features_shape={mask_features.shape}"
+            )
         
         return loss
     
@@ -241,9 +286,13 @@ class NPZFeatureDataset(Dataset):
         self.npz_files = npz_files
         self.datasets = [OphNetSurgicalDataset.load_npz(f) for f in npz_files]
         self.cumulative_lengths = np.cumsum([len(d) for d in self.datasets])
+        logging.debug(f"Initialized NPZFeatureDataset with {len(self.datasets)} files, "
+                     f"total samples: {self.cumulative_lengths[-1] if len(self.cumulative_lengths) > 0 else 0}")
     
     def __len__(self):
-        return self.cumulative_lengths[-1]
+        if not self.cumulative_lengths.size:
+            return 0
+        return int(self.cumulative_lengths[-1])  # 最後の累積長が総サンプル数
     
     def __getitem__(self, idx):
         # データセットのインデックスを特定
@@ -317,91 +366,126 @@ class NPZDataModule(pl.LightningDataModule):
 @click.option('--max_epochs', type=int, default=100, help='最大エポック数')
 @click.option('--feature_dim', type=int, default=1024, help='特徴量の次元数')
 @click.option('--learning_rate', type=float, default=1e-4, help='学習率')
-def main(npz_dir, output_dir, batch_size, num_workers, max_epochs, feature_dim, learning_rate):
+@click.option('--gpus', type=str, default=None, help='使用するGPU番号（カンマ区切り。例: "0,1"）')
+@click.option('--device', type=str, default='cuda', help='使用するデバイス（"cuda"または"cpu"）')
+@click.option('--use_wandb', is_flag=True, help='Weights & Biasesを使用する')
+@click.option('--wandb_project', type=str, default='surgical-phase-classification', help='Weights & Biasesのプロジェクト名')
+@click.option('--wandb_run_name', type=str, default=None, help='Weights & Biasesの実験名')
+def main(npz_dir, output_dir, batch_size, num_workers, max_epochs, feature_dim, 
+         learning_rate, gpus, device, use_wandb, wandb_project, wandb_run_name):
     """
-    npzファイルからTransformerベースの分類モデルを学習し、WandBで進捗を管理します。
+    メイン処理を行う関数
+    clickで受け取った引数を使用して学習を実行
     """
-    try:
-        # 出力ディレクトリの作成
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # WandBの初期化
-        wandb.init(
-            project="ophnet-phase-classification",
-            config={
-                "batch_size": batch_size,
-                "max_epochs": max_epochs,
-                "feature_dim": feature_dim,
-                "learning_rate": learning_rate,
-            }
-        )
-        
-        # データモジュールの準備
-        datamodule = NPZDataModule(
-            npz_dir=npz_dir,
-            batch_size=batch_size,
-            num_workers=num_workers
-        )
-        
-        # サンプルデータからクラス数を取得
-        datamodule.setup()
-        num_classes = datamodule.train_dataset.datasets[0].labels.shape[1]
-        
-        # モデルの初期化
-        model = SurgicalPhaseModule(
-            feature_dim=feature_dim,
-            num_classes=num_classes,
-            learning_rate=learning_rate
-        )
-        
-        # コールバックの設定
-        callbacks = [
-            pl.callbacks.ModelCheckpoint(
-                dirpath=output_dir,
-                filename='best-{epoch:02d}-{val_loss:.2f}',
-                monitor='val_loss',
-                mode='min',
-                save_top_k=3
-            ),
-            pl.callbacks.EarlyStopping(
-                monitor='val_loss',
-                patience=10,
-                mode='min'
-            ),
-            pl.callbacks.LearningRateMonitor(logging_interval='step'),
-            WandbLogger()
-        ]
-        
-        # トレーナーの設定と学習の実行
-        trainer = pl.Trainer(
-            max_epochs=max_epochs,
-            accelerator='auto',
-            devices=1,
-            callbacks=callbacks,
-            log_every_n_steps=10,
-            deterministic=True
-        )
-        
-        # 学習の実行
-        trainer.fit(model, datamodule=datamodule)
-        
-        # 最終モデルの保存
-        final_model_path = os.path.join(output_dir, 'final_model.ckpt')
-        trainer.save_checkpoint(final_model_path)
-        
-        # WandBにモデルを記録
-        artifact = wandb.Artifact('model', type='model')
-        artifact.add_file(final_model_path)
-        wandb.log_artifact(artifact)
-        
-        print(f"Training completed. Final model saved to {final_model_path}")
-        
-    except Exception as e:
-        print(f"[ERROR] Training failed: {e}")
-        raise
-    finally:
-        # WandBのクリーンアップ
-        wandb.finish()
+    logging.debug("Starting training process...")
+    logging.debug(f"Training configuration:\n"
+                 f"- NPZ directory: {npz_dir}\n"
+                 f"- Output directory: {output_dir}\n"
+                 f"- Batch size: {batch_size}\n"
+                 f"- Workers: {num_workers}\n"
+                 f"- Epochs: {max_epochs}\n"
+                 f"- Device: {device}\n"
+                 f"- Use WandB: {use_wandb}")
 
-if __name__ == '__main__':
+    # 出力ディレクトリの作成
+    os.makedirs(output_dir, exist_ok=True)
+    logging.debug(f"Created output directory: {output_dir}")
+
+    # データモジュールの初期化
+    logging.debug("Initializing data module...")
+    data_module = NPZDataModule(
+        npz_dir=npz_dir,
+        batch_size=batch_size,
+        num_workers=num_workers
+    )
+    logging.debug("Data module initialized")
+
+    # モデルの初期化
+    logging.debug("Creating model...")
+    model = SurgicalPhaseModule(
+        feature_dim=feature_dim,
+        num_classes=35,  # 手術フェーズの数
+        learning_rate=learning_rate
+    )
+    logging.debug("Model created")
+
+    # ロガーの設定
+    loggers = []
+    
+    # CSVロガー（常に有効）
+    csv_logger = pl_loggers.CSVLogger(
+        save_dir=output_dir,
+        name="logs"
+    )
+    loggers.append(csv_logger)
+    logging.debug("CSV logger initialized")
+
+    # TensorBoardロガー（常に有効）
+    tensorboard_logger = pl_loggers.TensorBoardLogger(
+        save_dir=output_dir,
+        name="tensorboard_logs"
+    )
+    loggers.append(tensorboard_logger)
+    logging.debug("TensorBoard logger initialized")
+
+    # WandBロガー（オプション）
+    if use_wandb:
+        logging.debug(f"Initializing WandB logger with project: {wandb_project}")
+        wandb_logger = WandbLogger(
+            project=wandb_project,
+            name=wandb_run_name,
+            save_dir=output_dir
+        )
+        loggers.append(wandb_logger)
+        logging.debug("WandB logger initialized")
+
+    # コールバックの設定
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=os.path.join(output_dir, "checkpoints"),
+            filename="model-{epoch:02d}-{val_loss:.2f}",
+            save_top_k=3,
+            monitor="val_loss",
+            mode="min"
+        )
+    ]
+    logging.debug("Model checkpoint callback configured")
+
+    # GPUの設定
+    if gpus:
+        gpu_list = [int(g) for g in gpus.split(",")]
+        logging.debug(f"Using GPUs: {gpu_list}")
+        trainer_kwargs = {
+            "accelerator": "gpu",
+            "devices": gpu_list,
+            "strategy": "ddp" if len(gpu_list) > 1 else "auto"
+        }
+    else:
+        logging.debug(f"Using device: {device}")
+        trainer_kwargs = {
+            "accelerator": device,
+            "devices": gpus if gpus else "0"
+        }
+
+    # トレーナーの設定と実行
+    logging.debug("Configuring trainer...")
+    trainer = Trainer(
+        max_epochs=max_epochs,
+        logger=loggers,
+        callbacks=callbacks,
+        **trainer_kwargs
+    )
+    logging.debug("Trainer configured")
+
+    # 学習の実行
+    logging.debug("Starting model training...")
+    trainer.fit(model, data_module)
+    logging.debug("Training completed")
+
+    # モデルの保存
+    model_save_path = os.path.join(output_dir, "final_model.ckpt")
+    trainer.save_checkpoint(model_save_path)
+    logging.debug(f"Final model saved to: {model_save_path}")
+
+if __name__ == "__main__":
     main()

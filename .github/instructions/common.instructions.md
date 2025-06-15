@@ -4,7 +4,62 @@
 
 ## プロジェクト概要
 
+このプロジェクトは、手術映像からフェーズ分類を行うための機械学習パイプラインを実装します。
 
+### 処理フローの概要
+
+1. データ準備フェーズ (vdata.py)
+   - 手術動画ファイルの読み込み
+   - メタ情報（case_id, phase, 時間情報）の抽出
+   - フレーム抽出とウィンドウ化
+   - 特徴量抽出（maxvit_large_tf_224.in21k使用）
+   - npzファイルへの保存
+
+2. 学習フェーズ (train.py)
+   - 保存されたnpzファイルの読み込み
+   - データセットの分割（訓練/検証）
+   - Transformerベースのモデル構築
+   - PyTorch Lightningによる学習実行
+   - モデルの保存とログ記録
+
+3. 可視化・評価フェーズ (view.py)
+   - 中間データの可視化
+   - 学習済みモデルの予測結果確認
+   - データセット統計情報の表示
+
+### 処理フローチャート
+
+```mermaid
+graph TD
+    subgraph "データ準備 (vdata.py)"
+        A[動画ファイル] --> B[メタ情報抽出]
+        B --> C[フレーム抽出]
+        C --> D[ウィンドウ化]
+        D --> E[特徴量抽出]
+        E --> F[npzファイル保存]
+    end
+
+    subgraph "学習 (train.py)"
+        F --> G[npzファイル読み込み]
+        G --> H[データセット分割]
+        H --> I[Transformerモデル構築]
+        I --> J[PyTorch Lightning学習]
+        J --> K[モデル保存]
+        J --> L[ログ記録]
+    end
+
+    subgraph "可視化・評価 (view.py)"
+        F --> M[中間データ可視化]
+        K --> N[予測結果確認]
+        G --> O[統計情報表示]
+    end
+
+    subgraph "モニタリング"
+        L --> P[WandB]
+        L --> Q[TensorBoard]
+        L --> R[CSVログ]
+    end
+```
 
 ### requirements.txt
 train.pyを実行する環境を整えます。以下のパッケージをインストールします。

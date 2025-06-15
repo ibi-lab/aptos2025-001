@@ -84,7 +84,7 @@ class OphNetSurgicalDataset(Dataset):
         mask_features (np.ndarray, optional): マスク特徴量の配列
         return_features (bool): __getitem__で特徴量を返すかどうか
     """
-    def __init__(self, chunks=None, mask_chunks=None, labels=None, features=None, mask_features=None, return_features=False):
+    def __init__(self, chunks=None, mask_chunks=None, labels=None, features=None, mask_features=None, return_features=True):
         self.chunks = chunks
         self.mask_chunks = mask_chunks
         self.labels = labels

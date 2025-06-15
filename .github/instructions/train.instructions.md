@@ -16,6 +16,23 @@ applyTo: "train.py"
 - click: CLIインターフェース
 - sklearn: データ分割
 - wandb: 実験管理とログ記録
+- logging: 詳細なログ出力
+
+## ログ設定
+
+スクリプト全体で統一的なログ出力を実現するため、以下の設定を行っています：
+
+```python
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+```
+
+これにより：
+- タイムスタンプ付きのログ出力
+- レベル別のログ管理（DEBUG/INFO/WARNING/ERROR）
+- 処理の進行状況の詳細な追跡が可能
 
 ## クラスとメソッドの詳細
 
@@ -88,10 +105,16 @@ npzファイルを管理し、トレーニング/検証用のDataLoaderを提供
 
 ##### setup(stage: Optional[str] = None)
 データセットの準備
-1. npzファイルの一覧取得
-2. トレーニング/検証データ分割
-3. データセットインスタンス作成
+1. npzファイルの一覧取得（空の場合はエラー）
+2. train/val分割とログ出力
+3. データセットの段階的なロードと結合
 4. 特徴量モードの有効化
+5. データセットサイズの確認とログ出力
+
+エラー処理：
+- npzファイルが存在しない場合のエラー処理
+- データセットが空の場合のエラー処理
+- ファイル読み込みエラーのハンドリング
 
 ##### train_dataloader()
 トレーニング用DataLoader生成
@@ -139,21 +162,32 @@ npzファイルを管理し、トレーニング/検証用のDataLoaderを提供
 
 ### main関数 (CLIコマンド)
 
-#### オプション
-- --npz_dir (str, required): npzファイルディレクトリ
-- --output_dir (str, default='models'): モデル保存ディレクトリ
-- --batch_size (int, default=32): バッチサイズ
-- --num_workers (int, default=4): ワーカー数
-- --max_epochs (int, default=100): 最大エポック数
-- --feature_dim (int, default=1024): 特徴量の次元数
-- --learning_rate (float, default=1e-4): 学習率
-
 #### 処理ステップ
-1. DataModuleの構築
-2. モデルの初期化
-3. WandbLoggerの設定
-4. Trainerの設定と学習実行
-5. モデル保存
+1. 学習設定のログ出力
+   ```
+   Training configuration:
+   - NPZ directory: {npz_dir}
+   - Output directory: {output_dir}
+   - Batch size: {batch_size}
+   - Workers: {num_workers}
+   - Epochs: {max_epochs}
+   - Device: {device}
+   - Use WandB: {use_wandb}
+   ```
+
+2. 出力ディレクトリの作成とログ
+3. データモジュールの初期化とログ
+4. モデルの作成とログ
+5. ロガーの設定
+   - CSVロガー（常時有効）
+   - TensorBoardロガー（常時有効）
+   - WandBロガー（オプション）
+6. コールバック設定
+7. GPU/デバイス設定
+8. トレーナーの設定と学習実行
+9. 最終モデルの保存
+
+各ステップでlogging.debugによる詳細な進行状況の出力を行い、問題発生時のデバッグを容易にします。
 
 ## 実装上のポイント
 
@@ -166,18 +200,22 @@ npzファイルを管理し、トレーニング/検証用のDataLoaderを提供
    - 効率的なデータローディング
    - Wandbによる実験管理
    - GPU活用の最適化
+   - **詳細なログ出力による進行状況の可視化**
 
 3. エラー処理
    - ファイル存在チェック
    - データロードエラーの処理
    - 適切なエラーメッセージ
+   - **段階的な処理のログ出力**
 
 4. モジュール性
    - PyTorch Lightningによる整理
    - 再利用可能なコンポーネント
    - 設定のカスタマイズ性
+   - **統一的なログ出力フォーマット**
 
 5. 監視と可視化
    - Wandbによる実験ログ
    - 学習進捗の可視化
    - チェックポイント管理
+   - **コンソールログによる詳細な進行状況表示**
