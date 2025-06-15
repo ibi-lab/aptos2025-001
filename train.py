@@ -134,29 +134,76 @@ class SurgicalPhaseClassificationModel(nn.Module):
 # --- Transformerベースのモデル定義 ---
 class TransformerFeatureClassifier(nn.Module):
     """
-    特徴量をTransformerで統合し、分類を行うモデル
+    特徴量をTransformerで統合し、分類を行うモデル。
+    過学習対策として以下の機能を追加:
+    - 追加のドロップアウト層
+    - Layer Normalization
+    - Residual connections
     """
-    def __init__(self, feature_dim, num_classes, nhead=8, num_layers=3, dim_feedforward=2048, dropout=0.1):
+    def __init__(self, feature_dim, num_classes, nhead=8, num_layers=3, dim_feedforward=2048, dropout=0.2):
         super().__init__()
         
-        # 特徴量の次元を調整する線形層
-        self.feature_proj = nn.Linear(feature_dim, dim_feedforward)
-        self.mask_feature_proj = nn.Linear(feature_dim, dim_feedforward)
+        # 特徴量の次元を調整する線形層とドロップアウト
+        # 特徴量の段階的な投影と非線形変換
+        self.feature_proj = nn.Sequential(
+            # 第1層: 入力次元 → 中間次元
+            nn.Linear(feature_dim, dim_feedforward * 2),
+            nn.LayerNorm(dim_feedforward * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            # 第2層: 中間次元 → 中間次元
+            nn.Linear(dim_feedforward * 2, dim_feedforward * 2),
+            nn.LayerNorm(dim_feedforward * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            # 第3層: 中間次元 → 出力次元
+            nn.Linear(dim_feedforward * 2, dim_feedforward),
+            nn.LayerNorm(dim_feedforward),
+            nn.Dropout(dropout)
+        )
         
-        # Transformerエンコーダ
+        # マスク特徴量も同様の段階的な投影を適用
+        self.mask_feature_proj = nn.Sequential(
+            # 第1層: 入力次元 → 中間次元
+            nn.Linear(feature_dim, dim_feedforward * 2),
+            nn.LayerNorm(dim_feedforward * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            # 第2層: 中間次元 → 中間次元
+            nn.Linear(dim_feedforward * 2, dim_feedforward * 2),
+            nn.LayerNorm(dim_feedforward * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            # 第3層: 中間次元 → 出力次元
+            nn.Linear(dim_feedforward * 2, dim_feedforward),
+            nn.LayerNorm(dim_feedforward),
+            nn.Dropout(dropout)
+        )
+        
+        # Transformerエンコーダ（ドロップアウトを強化）
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim_feedforward,
             nhead=nhead,
-            dim_feedforward=dim_feedforward,
+            dim_feedforward=dim_feedforward * 2,  # 中間層を広げて表現力を向上
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            activation='gelu'  # ReLUよりも安定した学習が期待できる
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(dim_feedforward)
+        )
         
-        # 分類ヘッド
+        # 分類ヘッド（多層化して表現力を向上）
         self.classifier = nn.Sequential(
+            nn.Linear(dim_feedforward, dim_feedforward),
+            nn.LayerNorm(dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(dim_feedforward, dim_feedforward // 2),
-            nn.ReLU(),
+            nn.LayerNorm(dim_feedforward // 2),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward // 2, num_classes)
         )
@@ -169,11 +216,13 @@ class TransformerFeatureClassifier(nn.Module):
         # 特徴量を結合 [batch_size, 2, dim_feedforward]
         x = torch.stack([x1, x2], dim=1)
         
-        # Transformerで特徴統合
-        x = self.transformer(x)
+        # Transformerで特徴統合（Residual connection）
+        trans_out = self.transformer(x)
+        x = x + trans_out  # Residual connection
         
-        # 系列の平均を取って分類
+        # Global Average Poolingで系列を統合
         x = x.mean(dim=1)
+        
         return self.classifier(x)
 
 # --- LightningModule ---
@@ -181,16 +230,25 @@ class SurgicalPhaseModule(pl.LightningModule):
     """
     学習プロセスを管理するLightningModule
     """
-    def __init__(self, feature_dim, num_classes, learning_rate=1e-4):
+    def __init__(self, feature_dim, num_classes, learning_rate=1e-4, weight_decay=1e-2):
         super().__init__()
         self.save_hyperparameters()
         self.model = TransformerFeatureClassifier(feature_dim, num_classes)
         self.learning_rate = learning_rate
-        self.criterion = nn.CrossEntropyLoss()
+        self.weight_decay = weight_decay
         
-        # WandB用のメトリクス初期化
+        # Loss関数にLabel Smoothingを追加
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        # メトリクス初期化
         self.train_acc = torchmetrics.Accuracy(task='multiclass', num_classes=num_classes)
         self.val_acc = torchmetrics.Accuracy(task='multiclass', num_classes=num_classes)
+        self.test_predictions = []
+        self.test_targets = []
+        
+        # 検証ロスの履歴を保持（Early Stopping用）
+        self.best_val_loss = float('inf')
+        self.val_loss_cnt = 0
     
     def forward(self, features, mask_features):
         # logging.debug(f"features: {features.shape}, mask_features: {mask_features.shape}")
@@ -252,18 +310,126 @@ class SurgicalPhaseModule(pl.LightningModule):
         
         return loss
     
+    def test_step(self, batch, batch_idx):
+        """
+        テストステップ：予測を行い、結果を保存
+        """
+        features = batch['features']
+        mask_features = batch.get('mask_features', None)
+        y = batch['label']
+        
+        # 予測
+        logits = self(features, mask_features)
+        loss = F.cross_entropy(logits, y)
+        
+        # 予測確率とクラスを計算
+        probs = F.softmax(logits, dim=1)
+        preds = torch.argmax(probs, dim=1)
+        targets = torch.argmax(y, dim=1)
+        
+        # 予測と正解を保存
+        self.test_predictions.extend(probs.cpu().numpy())
+        self.test_targets.extend(y.cpu().numpy())
+        
+        # メトリクスの計算
+        acc = (preds == targets).float().mean()
+        
+        # ログ出力
+        self.log('test_loss', loss, prog_bar=True)
+        self.log('test_acc', acc, prog_bar=True)
+        
+        return {'test_loss': loss, 'test_acc': acc}
+    
+    def test_epoch_end(self, outputs):
+        """
+        テストエポック終了時：平均メトリクスを計算
+        """
+        avg_loss = torch.stack([x['test_loss'] for x in outputs]).mean()
+        avg_acc = torch.stack([x['test_acc'] for x in outputs]).mean()
+        
+        # 予測と正解をnumpy配列として保存
+        predictions = np.array(self.test_predictions)
+        targets = np.array(self.test_targets)
+        
+        # 結果を保存
+        test_results = {
+            'test_loss': avg_loss.item(),
+            'test_acc': avg_acc.item(),
+            'predictions': predictions,
+            'targets': targets
+        }
+        
+        # 結果をファイルに保存
+        output_dir = self.trainer.checkpoint_callback.dirpath
+        results_path = os.path.join(output_dir, 'test_results.npz')
+        np.savez(results_path, **test_results)
+        
+        logging.info(f"Test results saved to {results_path}")
+        return test_results
+    
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        """
+        オプティマイザとスケジューラの設定
+        - AdamWオプティマイザ（Weight Decay対応）
+        - OneCycleLR scheduler（学習率の動的調整）
+        - Early Stoppingのための監視
+        """
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
         )
+        
+        # OneCycleLRスケジューラの設定
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.learning_rate,
+            epochs=self.trainer.max_epochs,
+            # steps_per_epoch=len(self.trainer.train_dataloader),
+            steps_per_epoch=300,  # 仮の値。実際にはトレーニングデータのサイズに依存
+            pct_start=0.3,  # 30%までWarm-up
+            div_factor=10.0,  # 初期学習率はmax_lrの1/10
+            final_div_factor=100.0  # 最終学習率はmax_lrの1/1000
+        )
+        
+        scheduler_config = {
+            "scheduler": scheduler,
+            "interval": "step",
+            "frequency": 1
+        }
+        
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss"
-            }
+            "lr_scheduler": scheduler_config
         }
+    
+    # def on_validation_epoch_end(self, outputs):
+    #     """
+    #     検証エポック終了時の処理
+    #     - Early Stoppingの判定
+    #     - 最良モデルの保存
+    #     """
+    #     # 平均検証損失の計算
+    #     avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
+        
+    #     # Early Stopping判定
+    #     if avg_loss < self.best_val_loss:
+    #         self.best_val_loss = avg_loss
+    #         self.val_loss_cnt = 0
+    #     else:
+    #         self.val_loss_cnt += 1
+            
+    #         if self.val_loss_cnt >= 5:  # 5エポック改善がない場合
+    #             # 学習率を1/2に削減
+    #             for param_group in self.trainer.optimizers[0].param_groups:
+    #                 param_group['lr'] *= 0.5
+    #             logging.info(f"Reducing learning rate to {param_group['lr']}")
+    #             self.val_loss_cnt = 0  # カウンタをリセット
+        
+    #     # WandBへのログ記録
+    #     self.log('val/avg_loss', avg_loss)
+    #     self.log('val/best_loss', self.best_val_loss)
+    #     self.log('val/no_improve_epochs', self.val_loss_cnt)
 
 # --- クラス重み計算 ---
 def calculate_class_weights(df, column):
@@ -374,118 +540,99 @@ class NPZDataModule(pl.LightningDataModule):
 def main(npz_dir, output_dir, batch_size, num_workers, max_epochs, feature_dim, 
          learning_rate, gpus, device, use_wandb, wandb_project, wandb_run_name):
     """
-    メイン処理を行う関数
-    clickで受け取った引数を使用して学習を実行
+    メイン学習処理
+    過学習対策として以下を追加:
+    - Early Stoppingコールバック
+    - モデルチェックポイントの保存
+    - 学習率の自動調整
     """
-    logging.debug("Starting training process...")
-    logging.debug(f"Training configuration:\n"
-                 f"- NPZ directory: {npz_dir}\n"
-                 f"- Output directory: {output_dir}\n"
-                 f"- Batch size: {batch_size}\n"
-                 f"- Workers: {num_workers}\n"
-                 f"- Epochs: {max_epochs}\n"
-                 f"- Device: {device}\n"
-                 f"- Use WandB: {use_wandb}")
-
+    # 設定のログ出力
+    logging.info(f"""Training configuration:
+    - NPZ directory: {npz_dir}
+    - Output directory: {output_dir}
+    - Batch size: {batch_size}
+    - Workers: {num_workers}
+    - Epochs: {max_epochs}
+    - Device: {device}
+    - Use WandB: {use_wandb}
+    """)
+    
     # 出力ディレクトリの作成
     os.makedirs(output_dir, exist_ok=True)
-    logging.debug(f"Created output directory: {output_dir}")
-
+    
     # データモジュールの初期化
-    logging.debug("Initializing data module...")
     data_module = NPZDataModule(
         npz_dir=npz_dir,
         batch_size=batch_size,
         num_workers=num_workers
     )
-    logging.debug("Data module initialized")
-
-    # モデルの初期化
-    logging.debug("Creating model...")
+    data_module.setup()
+    
+    # モデルの作成
     model = SurgicalPhaseModule(
         feature_dim=feature_dim,
-        num_classes=35,  # 手術フェーズの数
-        learning_rate=learning_rate
+        num_classes=35,  # 手術フェーズのクラス数
+        learning_rate=learning_rate,
+        weight_decay=1e-2  # L2正則化の追加
     )
-    logging.debug("Model created")
-
-    # ロガーの設定
-    loggers = []
     
-    # CSVロガー（常に有効）
-    csv_logger = pl_loggers.CSVLogger(
-        save_dir=output_dir,
-        name="logs"
-    )
-    loggers.append(csv_logger)
-    logging.debug("CSV logger initialized")
-
-    # TensorBoardロガー（常に有効）
-    tensorboard_logger = pl_loggers.TensorBoardLogger(
-        save_dir=output_dir,
-        name="tensorboard_logs"
-    )
-    loggers.append(tensorboard_logger)
-    logging.debug("TensorBoard logger initialized")
-
-    # WandBロガー（オプション）
+    # ロガーの設定
+    loggers = [
+        pl_loggers.CSVLogger(output_dir),
+        pl_loggers.TensorBoardLogger(output_dir)
+    ]
     if use_wandb:
-        logging.debug(f"Initializing WandB logger with project: {wandb_project}")
-        wandb_logger = WandbLogger(
+        loggers.append(WandbLogger(
             project=wandb_project,
             name=wandb_run_name,
-            save_dir=output_dir
-        )
-        loggers.append(wandb_logger)
-        logging.debug("WandB logger initialized")
-
+            log_model=True
+        ))
+    
     # コールバックの設定
     callbacks = [
-        ModelCheckpoint(
-            dirpath=os.path.join(output_dir, "checkpoints"),
-            filename="model-{epoch:02d}-{val_loss:.2f}",
-            save_top_k=3,
-            monitor="val_loss",
-            mode="min"
-        )
+        # Early Stopping
+        pl.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=10,
+            mode='min',
+            min_delta=1e-4
+        ),
+        # モデルチェックポイント
+        pl.callbacks.ModelCheckpoint(
+            dirpath=output_dir,
+            filename='{epoch}-{val_loss:.2f}',
+            monitor='val_loss',
+            mode='min',
+            save_top_k=3,  # 上位3つのモデルを保存
+            save_last=True  # 最新のモデルも保存
+        ),
+        # 学習率のモニタリング
+        pl.callbacks.LearningRateMonitor(logging_interval='step'),
+        # GPUメモリ使用量のモニタリング
+        pl.callbacks.DeviceStatsMonitor()
     ]
-    logging.debug("Model checkpoint callback configured")
-
-    # GPUの設定
-    if gpus:
-        gpu_list = [int(g) for g in gpus.split(",")]
-        logging.debug(f"Using GPUs: {gpu_list}")
-        trainer_kwargs = {
-            "accelerator": "gpu",
-            "devices": gpu_list,
-            "strategy": "ddp" if len(gpu_list) > 1 else "auto"
-        }
-    else:
-        logging.debug(f"Using device: {device}")
-        trainer_kwargs = {
-            "accelerator": device,
-            "devices": gpus if gpus else "0"
-        }
-
-    # トレーナーの設定と実行
-    logging.debug("Configuring trainer...")
-    trainer = Trainer(
+    
+    # トレーナーの設定
+    trainer = pl.Trainer(
         max_epochs=max_epochs,
+        accelerator='gpu' if device == 'cuda' else 'cpu',
+        devices=[int(g) for g in gpus.split(',')] if gpus else 1,
         logger=loggers,
         callbacks=callbacks,
-        **trainer_kwargs
+        gradient_clip_val=1.0,  # 勾配クリッピングの追加
+        accumulate_grad_batches=2,  # 勾配累積によるバッチサイズの実質的な増加
+        precision=16,  # 混合精度学習の有効化
+        strategy='ddp' if device == 'cuda' and len(gpus.split(',')) > 1 else "auto"
     )
-    logging.debug("Trainer configured")
-
+    
     # 学習の実行
-    logging.debug("Starting model training...")
     trainer.fit(model, data_module)
-    logging.debug("Training completed")
-
-    # モデルの保存
-    model_save_path = os.path.join(output_dir, "final_model.ckpt")
-    trainer.save_checkpoint(model_save_path)
-    logging.debug(f"Final model saved to: {model_save_path}")
+    
+    # 最良モデルのパスを出力
+    best_model_path = trainer.checkpoint_callback.best_model_path
+    logging.info(f"Best model saved at: {best_model_path}")
+    
+    return best_model_path
 
 if __name__ == "__main__":
     main()
