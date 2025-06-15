@@ -75,10 +75,10 @@ def cli():
 @cli.command()
 @click.argument('npz_path', type=click.Path(exists=True))
 @click.option('-o', '--output_img_path', type=str, help='可視化画像の保存先パス（省略時は入力ファイルと同名のpng）')
-def show_npz(npz_path, output_img_path):
+def show_image_from_npz(npz_path, output_img_path):
     """
-    vdata.pyで生成されたnpzファイル（中間ファイル）を可視化。
-    画像・マスク・ラベル群をmatplotlibで可視化し、指定パスに保存。
+    vdata.pyで生成されたnpzファイル（中間ファイル）の画像・マスク・ラベルを可視化。
+    可視化結果を指定パスに保存。
 
     Args:
         npz_path: npzファイルパス（必須）
@@ -93,11 +93,10 @@ def show_npz(npz_path, output_img_path):
     try:
         # データセットをロード
         dataset = OphNetSurgicalDataset.load_npz(npz_path)
-        print('Dataset info:')
-        print(f'サンプル数: {len(dataset)}')
-        print(f'Chunks shape: {dataset.chunks.shape}')
-        print(f'Mask chunks shape: {dataset.mask_chunks.shape}')
-        print(f'Labels shape: {dataset.labels.shape}')
+        
+        if dataset.chunks is None or dataset.mask_chunks is None:
+            print("警告: このnpzファイルには画像データが含まれていません")
+            return
         
         # チャンクからサンプルを生成
         samples = []
@@ -112,9 +111,72 @@ def show_npz(npz_path, output_img_path):
         
         # 可視化
         show_sample(images, masks, label, filepath=output_img_path, num_samples=num_samples)
+
     except Exception as e:
         print(f"Error loading npz file: {e}")
 
+
+@cli.command()
+@click.argument('npz_path', type=click.Path(exists=True))
+def show_features_from_npz(npz_path):
+    """
+    vdata.pyで生成されたnpzファイル（中間ファイル）の特徴量とラベル情報を標準出力に表示。
+
+    Args:
+        npz_path: npzファイルパス（必須）
+    """
+    from vdata import OphNetSurgicalDataset
+
+    try:
+        # データセットをロード
+        dataset = OphNetSurgicalDataset.load_npz(npz_path)
+        
+        # データセット基本情報の表示
+        print('=== データセット基本情報 ===')
+        print(f'サンプル数: {len(dataset)}')
+        
+        # 画像/マスクデータの情報表示
+        if dataset.chunks is not None:
+            print('\n=== 画像データ情報 ===')
+            print(f'画像チャンクの形状: {dataset.chunks.shape}')
+            print(f'画像の値域: [{dataset.chunks.min():.3f}, {dataset.chunks.max():.3f}]')
+            print(f'画像の平均値: {dataset.chunks.mean():.3f}')
+            print(f'画像の標準偏差: {dataset.chunks.std():.3f}')
+        
+        if dataset.mask_chunks is not None:
+            print('\n=== マスクデータ情報 ===')
+            print(f'マスクチャンクの形状: {dataset.mask_chunks.shape}')
+            print(f'マスクの値域: [{dataset.mask_chunks.min():.3f}, {dataset.mask_chunks.max():.3f}]')
+            print(f'マスクの平均値: {dataset.mask_chunks.mean():.3f}')
+            print(f'マスクの標準偏差: {dataset.mask_chunks.std():.3f}')
+        
+        # 特徴量データの情報表示
+        if dataset.features is not None:
+            print('\n=== 画像特徴量情報 ===')
+            print(f'特徴量の形状: {dataset.features.shape}')
+            print(f'特徴量の値域: [{dataset.features.min():.3f}, {dataset.features.max():.3f}]')
+            print(f'特徴量の平均値: {dataset.features.mean():.3f}')
+            print(f'特徴量の標準偏差: {dataset.features.std():.3f}')
+        
+        if dataset.mask_features is not None:
+            print('\n=== マスク特徴量情報 ===')
+            print(f'マスク特徴量の形状: {dataset.mask_features.shape}')
+            print(f'マスク特徴量の値域: [{dataset.mask_features.min():.3f}, {dataset.mask_features.max():.3f}]')
+            print(f'マスク特徴量の平均値: {dataset.mask_features.mean():.3f}')
+            print(f'マスク特徴量の標準偏差: {dataset.mask_features.std():.3f}')
+        
+        # ラベル情報の表示
+        if dataset.labels is not None:
+            print('\n=== ラベル情報 ===')
+            print(f'ラベルの形状: {dataset.labels.shape}')
+            label_dist = dataset.labels.argmax(axis=1)
+            unique, counts = np.unique(label_dist, return_counts=True)
+            print('\nラベル分布:')
+            for label, count in zip(unique, counts):
+                print(f'クラス {label}: {count}サンプル ({count/len(dataset)*100:.1f}%)')
+
+    except Exception as e:
+        print(f"Error loading npz file: {e}")
 
 @cli.command()
 @click.option('--model_ckpt', type=str, required=True, help='学習済みモデルckpt')

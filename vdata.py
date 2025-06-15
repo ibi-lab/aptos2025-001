@@ -74,19 +74,28 @@ class SlidingWindowExtractor:
 class OphNetSurgicalDataset(Dataset):
     """
     手術フェーズ分類用のデータセットクラス
+    画像/マスクデータと特徴量の両方を扱うことができます
 
     Args:
         chunks (np.ndarray): 動画フレームのチャンク配列
         mask_chunks (np.ndarray): マスク画像のチャンク配列
         labels (np.ndarray): one-hotラベルの配列
+        features (np.ndarray, optional): 画像特徴量の配列
+        mask_features (np.ndarray, optional): マスク特徴量の配列
+        return_features (bool): __getitem__で特徴量を返すかどうか
     """
-    def __init__(self, chunks, mask_chunks, labels):
+    def __init__(self, chunks=None, mask_chunks=None, labels=None, features=None, mask_features=None, return_features=False):
         self.chunks = chunks
         self.mask_chunks = mask_chunks
         self.labels = labels
+        self.features = features
+        self.mask_features = mask_features
+        self.return_features = return_features
 
     def __len__(self):
-        return len(self.chunks)
+        if self.return_features and self.features is not None:
+            return len(self.features)
+        return len(self.chunks) if self.chunks is not None else 0
 
     def __getitem__(self, idx):
         """
@@ -96,180 +105,214 @@ class OphNetSurgicalDataset(Dataset):
             idx (int): サンプルのインデックス
 
         Returns:
-            dict:
-                - 'image': 前処理済み画像 (torch.Tensor)
-                - 'mask': マスク画像 (torch.Tensor) or None
-                - 'label': one-hotラベル (torch.Tensor)
+            特徴量モード (return_features=True) の場合:
+                dict:
+                    - 'features': 画像特徴量 (torch.Tensor)
+                    - 'mask_features': マスク特徴量 (torch.Tensor)
+                    - 'label': one-hotラベル (torch.Tensor)
+            画像モード (return_features=False) の場合:
+                dict:
+                    - 'image': 前処理済み画像 (torch.Tensor)
+                    - 'mask': マスク画像 (torch.Tensor)
+                    - 'label': one-hotラベル (torch.Tensor)
         """
         try:
-            # ウィンドウ選択
-            window = self.chunks[idx]
-
-            # 画像平均化
-            img = window.mean(axis=0).astype(np.uint8)
-
-            # 画像前処理
-            img = cv2.resize(img, (224, 224))
-            img = img.transpose(2, 0, 1) / 255.0
-
-            # マスク処理（マスクがある場合のみ）
-            if self.mask_chunks is not None:
-                mask_window = self.mask_chunks[idx]
-                mask = mask_window.mean(axis=0).astype(np.uint8)
-                mask = cv2.resize(mask, (224, 224))
-                mask = mask.transpose(2, 0, 1)
+            if self.return_features and self.features is not None:
+                return {
+                    'features': torch.tensor(self.features[idx], dtype=torch.float32),
+                    'mask_features': torch.tensor(self.mask_features[idx], dtype=torch.float32) if self.mask_features is not None else None,
+                    'label': torch.tensor(self.labels[idx], dtype=torch.float32)
+                }
             else:
-                # マスクがない場合は画像をそのまま使用
-                mask = img.copy()
-
-            # one-hotラベル
-            label = self.labels[idx]
-
-            return {
-                'image': torch.tensor(img, dtype=torch.float32),
-                'mask': torch.tensor(mask, dtype=torch.float32),
-                'label': torch.tensor(label, dtype=torch.float32)
-            }
-
+                chunk = self.chunks[idx].astype(np.float32) / 255.0
+                chunk = chunk.transpose(0, 3, 1, 2)
+                mask_chunk = None
+                if self.mask_chunks is not None:
+                    mask_chunk = self.mask_chunks[idx].astype(np.float32) / 255.0
+                    mask_chunk = mask_chunk.transpose(0, 3, 1, 2)
+                return {
+                    'image': torch.tensor(chunk),
+                    'mask': torch.tensor(mask_chunk) if mask_chunk is not None else None,
+                    'label': torch.tensor(self.labels[idx], dtype=torch.float32)
+                }
         except Exception as e:
-            logging.error(f"サンプル生成エラー index {idx}: {e}")
-            # エラー時はダミーデータを返す
-            dummy = torch.zeros((3, 224, 224), dtype=torch.float32)
-            label = torch.zeros(self.labels.shape[1], dtype=torch.float32)
-            return {'image': dummy, 'mask': dummy, 'label': label}
+            logging.error(f"サンプル取得エラー (idx={idx}): {e}")
+            raise
 
     @classmethod
-    def create_from_video(cls, video_path, phase, phase2idx, window_size=16, stride=4, skip_generate_masks=True, max_frames=None):
+    def create_from_video(cls, video_path, phase, phase2idx, window_size=16, stride=4, 
+                     skip_generate_masks=True, max_frames=128, extract_features=True, 
+                     return_features=True, device='cuda'):
         """
-        動画ファイルからデータセットを作成するビルダーメソッド
+        動画ファイルからデータセットを生成します
 
         Args:
             video_path (str): 動画ファイルパス
-            phase (str): フェーズラベル
+            phase (str): 手術フェーズ名
             phase2idx (dict): フェーズ名からインデックスへのマッピング
             window_size (int): ウィンドウサイズ
             stride (int): ストライド幅
-            skip_generate_masks (bool): マスク生成をスキップするかどうか。
-                                      Trueの場合、画像をそのままマスクとして使用
+            skip_generate_masks (bool): マスク生成をスキップするかどうか
             max_frames (int, optional): 読み込む最大フレーム数
+            extract_features (bool): 特徴量を抽出するかどうか
+            device (str): 特徴量抽出に使用するデバイス
 
         Returns:
-            OphNetSurgicalDataset: 生成されたデータセットインスタンス
-
-        Raises:
-            FileNotFoundError: 動画ファイルが存在しない場合
-            RuntimeError: 動画の読み込みに失敗した場合
+            OphNetSurgicalDataset: 生成されたデータセット
         """
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"動画ファイルが存在しません: {video_path}")
-
-        # 動画フレーム読み込み
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"動画ファイルを開けません: {video_path}")
-
-        # 総フレーム数を取得
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            raise RuntimeError(f"フレーム数を取得できません: {video_path}")
-        
-        # 読み込み開始位置の決定
-        start_frame = 0
-        if max_frames and total_frames > max_frames:
-            # ランダムな開始位置を選択（最後のmax_framesを超えないように）
-            max_start = total_frames - max_frames
-            start_frame = random.randint(0, max_start)
-            logging.debug(f"総フレーム数 {total_frames} から {start_frame} フレーム目からランダムに {max_frames} フレーム読み込みます")
-            
-        # 開始位置までシーク
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        
-        frames = []
-        frame_count = 0
         try:
+            # 動画の読み込みと前処理
+            cap = cv2.VideoCapture(video_path)
+            frames = []
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                # フレームを320x240にリサイズ
-                frame = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (320, 240))
+                frame = cv2.resize(frame, (224, 224))
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(frame)
-                frame_count += 1
-                if max_frames and frame_count >= max_frames:
-                    logging.debug(f"指定フレーム数 {max_frames} の読み込みが完了しました")
-                    break
-        finally:
+
             cap.release()
 
-        if not frames:
-            raise RuntimeError(f"フレームを読み込めません: {video_path}")
+            if not frames:
+                logging.error(f"フレームを読み込めませんでした: {video_path}")
+                return None
 
-        logging.debug(f"読み込んだフレーム数: {len(frames)}")
+            # max_framesが指定されている場合、ランダムな位置から連続したフレームを取得
+            if max_frames is not None and len(frames) > max_frames:
+                start_idx = random.randint(0, len(frames) - max_frames)
+                frames = frames[start_idx:start_idx + max_frames]
 
-        mask_frames = None
-        if not skip_generate_masks:
-            # マスク生成（実際のマスク生成ロジックをここに実装）
-            mask_frames = frames.copy()
-            logging.debug("マスク生成を実行します")
-        else:
-            logging.debug("マスク生成をスキップします")
+            # ウィンドウ抽出器の準備
+            extractor = SlidingWindowExtractor(window_size=window_size, stride=stride)
+            chunks = extractor.extract_windows(frames)
 
-        # スライディングウィンドウ抽出
-        sw_extractor = SlidingWindowExtractor(window_size, stride)
-        if mask_frames is not None:
-            windows, mask_windows = sw_extractor.extract_windows(frames, mask_frames)
-        else:
-            windows = sw_extractor.extract_windows(frames)
-            mask_windows = None
+            # マスクの生成（オプション）
+            mask_chunks = None
+            if not skip_generate_masks:
+                masks = [generate_mask(frame) for frame in frames]
+                mask_chunks = extractor.extract_windows(masks)
 
-        logging.debug(f"生成されたウィンドウ数: {len(windows)}")
+            # ラベルの準備
+            phase_idx = phase2idx[phase]
+            num_chunks = len(chunks)
+            labels = np.zeros((num_chunks, len(phase2idx)))
+            labels[:, phase_idx] = 1
 
-        # one-hotラベル生成
-        label = np.zeros(len(phase2idx), dtype=np.float32)
-        label[phase2idx[phase]] = 1.0
-        labels = np.tile(label, (len(windows), 1))  # 全ウィンドウに同じラベルを付与
+            # 特徴量の抽出（オプション）
+            features = None
+            mask_features = None
+            if extract_features:
+                import timm
+                import torch
+                from torch.utils.data import DataLoader
 
-        return cls(windows, mask_windows, labels)
+                # 一時的なデータセットを作成
+                temp_dataset = cls(chunks=chunks, mask_chunks=mask_chunks, labels=labels)
+                
+                # DataLoaderの設定
+                batch_size = 8
+                dataloader = DataLoader(
+                    temp_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=4,
+                    pin_memory=True
+                )
 
-    def save_npz(self, file_path):
+                # 特徴抽出モデルの準備
+                model = timm.create_model('maxvit_large_tf_224.in21k', pretrained=True, num_classes=0)
+                model = model.to(device)
+                model.eval()
+
+                # 特徴量抽出
+                features_list = []
+                mask_features_list = []
+
+                with torch.no_grad():
+                    for batch in tqdm(dataloader, desc="Extracting features"):
+                        images = batch['image'].to(device)
+                        features_list.append(model(images).cpu().numpy())
+                        
+                        if batch['mask'] is not None:
+                            masks = batch['mask'].to(device)
+                            mask_features_list.append(model(masks).cpu().numpy())
+
+                features = np.concatenate(features_list)
+                if mask_features_list:
+                    mask_features = np.concatenate(mask_features_list)
+
+            # データセットの作成
+            return cls(
+                chunks=chunks,
+                mask_chunks=mask_chunks,
+                labels=labels,
+                features=features,
+                mask_features=mask_features,
+                return_features=return_features
+            )
+
+        except Exception as e:
+            logging.error(f"データセット生成エラー {video_path}: {e}")
+            return None
+
+    def save_npz(self, file_path, save_images=False):
         """
         データセットをnpz形式で保存します。
 
         Args:
             file_path (str): 保存先のファイルパス
+            save_images (bool): 画像/マスクデータも保存するかどうか
         """
-        np.savez_compressed(
-            file_path,
-            chunks=self.chunks,
-            mask_chunks=self.mask_chunks,
-            labels=self.labels
-        )
+        save_dict = {
+            'labels': self.labels
+        }
+        
+        if save_images and self.chunks is not None:
+            save_dict['chunks'] = self.chunks
+            if self.mask_chunks is not None:
+                save_dict['mask_chunks'] = self.mask_chunks
+
+        if self.features is not None:
+            save_dict['features'] = self.features
+            if self.mask_features is not None:
+                save_dict['mask_features'] = self.mask_features
+
+        np.savez_compressed(file_path, **save_dict)
         logging.debug(f"データセットを {file_path} に保存しました")
 
     @classmethod
     def load_npz(cls, file_path):
         """
-        npzファイルからデータセットを読み込みます。
+        npzファイルからデータセットを読み込みます
 
         Args:
             file_path (str): 読み込むファイルのパス
 
         Returns:
-            OphNetSurgicalDataset: 読み込まれたデータセットインスタンス
+            OphNetSurgicalDataset: 読み込まれたデータセット
         """
         try:
             data = np.load(file_path)
+            return_features = 'features' in data or 'mask_features' in data
+            if return_features:
+                logging.debug(f"特徴量を含むデータセットを読み込み: {file_path}")
+            else:
+                logging.debug(f"画像/マスクデータのみのデータセットを読み込み: {file_path}")
             return cls(
-                chunks=data['chunks'],
-                mask_chunks=data['mask_chunks'],
-                labels=data['labels']
+                chunks=data['chunks'] if 'chunks' in data else None,
+                mask_chunks=data['mask_chunks'] if 'mask_chunks' in data else None,
+                labels=data['labels'],
+                features=data['features'] if 'features' in data else None,
+                mask_features=data['mask_features'] if 'mask_features' in data else None
             )
         except Exception as e:
             logging.error(f"npzファイル読み込みエラー {file_path}: {e}")
             raise
 
 
-def process_video(row, phase2idx, intermediate_pth=None, skip_existing=False):
+def process_video(row, phase2idx, intermediate_pth=None, skip_existing=False, 
+               extract_features=True, save_images=False, device='cuda'):
     """
     1動画の処理を行う関数
 
@@ -278,6 +321,9 @@ def process_video(row, phase2idx, intermediate_pth=None, skip_existing=False):
         phase2idx (dict): フェーズ名からインデックスへのマッピング
         intermediate_pth (str, optional): 中間ファイル保存先ディレクトリ
         skip_existing (bool): 既存ファイルをスキップするかどうか
+        extract_features (bool): 特徴量を抽出するかどうか
+        save_images (bool): 画像/マスクデータも保存するかどうか
+        device (str): 特徴量抽出に使用するデバイス
 
     Returns:
         OphNetSurgicalDataset: 生成されたデータセット、もしくはNone（エラー時）
@@ -289,9 +335,7 @@ def process_video(row, phase2idx, intermediate_pth=None, skip_existing=False):
             try:
                 return OphNetSurgicalDataset.load_npz(npz_path)
             except Exception as e:
-                logging.error(f"中間ファイル読み込みエラー {npz_path}: {e}")
-                if os.path.exists(npz_path):
-                    os.remove(npz_path)
+                logging.warning(f"既存ファイル読み込みエラー {npz_path}: {e}")
 
     try:
         # データセットをビルダーメソッドで作成
@@ -302,19 +346,23 @@ def process_video(row, phase2idx, intermediate_pth=None, skip_existing=False):
             window_size=16,
             stride=4,
             skip_generate_masks=False,
-            max_frames=128  # 最大フレーム数を制限
+            max_frames=128,
+            extract_features=extract_features,
+            device=device
         )
         
         # データセット全体をnpz形式で保存
         if dataset is not None and npz_path:
-            dataset.save_npz(npz_path)
+            dataset.save_npz(npz_path, save_images=save_images)
+            
         return dataset
     except Exception as e:
         logging.error(f"動画処理エラー {row['video_path']}: {e}")
         return None
 
 
-def main(video_dir, output_pth, intermediate_pth=None, skip_existing=False, n_jobs=4, n_samples=None):
+def main(video_dir, output_pth, intermediate_pth=None, skip_existing=False, n_jobs=4, 
+         n_samples=None, extract_features=True, save_images=False, device='cuda'):
     """
     メイン処理を行う関数
 
@@ -324,7 +372,10 @@ def main(video_dir, output_pth, intermediate_pth=None, skip_existing=False, n_jo
         intermediate_pth (str, optional): 中間ファイル保存先ディレクトリ
         skip_existing (bool): 既存ファイルをスキップするかどうか
         n_jobs (int): 並列ジョブ数
-        n_samples (int, optional): 抽出するサンプル数。指定した場合、フェーズごとに均等に配分します。
+        n_samples (int, optional): 抽出するサンプル数。フェーズごとに均等に配分されます。
+        extract_features (bool): 特徴量を抽出するかどうか
+        save_images (bool): 画像/マスクデータも保存するかどうか
+        device (str): 特徴量抽出に使用するデバイス
     """
     if not os.path.exists(video_dir):
         raise FileNotFoundError(f"動画フォルダが存在しません: {video_dir}")
@@ -437,26 +488,27 @@ def main(video_dir, output_pth, intermediate_pth=None, skip_existing=False, n_jo
 
     # 並列処理でデータセット生成
     datasets = Parallel(n_jobs=n_jobs)(
-        delayed(process_video)(row, phase2idx, intermediate_pth, skip_existing)
+        delayed(process_video)(
+            row, phase2idx, intermediate_pth, skip_existing,
+            extract_features=extract_features, save_images=save_images, device=device
+        )
         for row in tqdm(rows, desc='Extracting datasets')
     )
     
-    # # 有効なデータセットをフィルタリング
-    # datasets = [d for d in datasets if d is not None]
+    # 有効なデータセットをフィルタリング
+    datasets = [d for d in datasets if d is not None]
 
-    # if not datasets:
-    #     raise RuntimeError("有効なデータセットを生成できませんでした")
-
-    # # データセットの結合
-    # total_samples = sum(len(d) for d in datasets)
-    # logging.debug(f"合計 {total_samples} サンプルを生成しました")
-
-    # # データセット全体を保存（pickleプロトコル5を使用）
-    # logging.debug(f"データセットを {output_pth} に保存します")
-    # torch.save(datasets, output_pth, pickle_protocol=5)
-    # print(f"データセットを {output_pth} に保存しました（合計 {total_samples} サンプル）")
+    if not datasets:
+        raise RuntimeError("有効なデータセットを生成できませんでした")
     
+    # データセットの結合
+    total_samples = sum(len(d) for d in datasets)
+    logging.debug(f"合計 {total_samples} サンプルを生成しました")
 
+    # データセット全体を保存（pickleプロトコル5を使用）
+    logging.debug(f"データセットを {output_pth} に保存します")
+    torch.save(datasets, output_pth, pickle_protocol=5)
+    print(f"データセットを {output_pth} に保存しました（合計 {total_samples} サンプル）")
 
 @click.command()
 @click.option('--video_dir', type=str, required=True, help='動画フォルダパス')
@@ -465,9 +517,14 @@ def main(video_dir, output_pth, intermediate_pth=None, skip_existing=False, n_jo
 @click.option('--skip_existing', is_flag=True, help='既存の中間ファイルがあればスキップ')
 @click.option('--n_jobs', type=int, default=4, help='並列ジョブ数')
 @click.option('--n_samples', type=int, default=None, help='抽出するサンプル数。フェーズごとに均等に配分されます。')
-def cli(video_dir, output_pth, intermediate_pth, skip_existing, n_jobs, n_samples):
-    """動画フォルダからデータセットを生成するCLIツール"""
-    main(video_dir, output_pth, intermediate_pth, skip_existing, n_jobs, n_samples)
+@click.option('--extract_features', is_flag=True, help='特徴量を抽出するかどうか')
+@click.option('--no_save_images', is_flag=True, help='画像/マスクデータを保存しないようにする')
+@click.option('--device', type=str, default='cuda', help='特徴量抽出に使用するデバイス')
+def cli(video_dir, output_pth, intermediate_pth, skip_existing, n_jobs, n_samples,
+        extract_features, no_save_images, device):
+    """vdata.pyのCLIエントリポイント"""
+    main(video_dir, output_pth, intermediate_pth, skip_existing, n_jobs, n_samples,
+         extract_features=extract_features, save_images=not no_save_images, device=device)
 
 
 if __name__ == '__main__':

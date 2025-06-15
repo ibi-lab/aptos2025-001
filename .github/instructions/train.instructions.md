@@ -15,19 +15,15 @@ applyTo: "train.py"
 - numpy: 数値計算
 - click: CLIインターフェース
 - sklearn: データ分割
-- cv2: 画像処理
+- wandb: 実験管理とログ記録
 
 ## クラスとメソッドの詳細
 
-### OphNetSurgicalDataset (torch.utils.data.Dataset)
-手術フェーズ分類用のデータセットクラス
+### NPZFeatureDataset (torch.utils.data.Dataset)
+vdata.pyで生成されたnpzファイルから特徴量とラベルを読み込むデータセット
 
 #### コンストラクタ引数
-- df (pd.DataFrame): 動画メタデータのデータフレーム
-- phase2idx (dict): フェーズ名からインデックスへのマッピング
-- window_size (int, default=16): ウィンドウサイズ
-- stride (int, default=8): ストライド幅
-- max_frames (int, default=64): 読み込む最大フレーム数
+- npz_files (list): npzファイルのパスリスト
 
 #### メソッド
 
@@ -35,59 +31,24 @@ applyTo: "train.py"
 データセットの長さを返す
 
 ##### __getitem__(idx)
-指定インデックスのサンプルを取得
+指定インデックスのサンプルを取得（特徴量とラベル）
 
-処理ステップ:
-1. データフレームから動画情報取得
-2. 動画フレーム読み込み
-3. マスク生成（R/Gチャンネル）
-4. ウィンドウ抽出とランダム選択
-5. 画像処理（平均化、リサイズ、正規化）
-6. one-hotラベル生成
-7. エラー時はダミーデータ返却
-
-##### _read_video(video_path)
-動画ファイルからフレームを読み込む内部メソッド
-
-### SlidingWindowExtractor
-動画フレームからウィンドウを抽出するクラス
+### NPZDataModule (pl.LightningDataModule)
+npzファイルを管理し、トレーニング/検証用のDataLoaderを提供するDataModule
 
 #### コンストラクタ引数
-- window_size (int, default=16): ウィンドウサイズ
-- stride (int, default=8): ストライド幅
-
-#### メソッド
-
-##### extract_windows(video_frames, masks=None)
-ウィンドウ抽出処理
-
-処理ステップ:
-1. ウィンドウリスト初期化
-2. フレーム分割とスタック
-3. マスクウィンドウ生成（オプション）
-4. numpy配列に変換して返却
-
-### OphNetDataModule (pl.LightningDataModule)
-データセットの管理とデータローダーの構築を行うクラス
-
-#### コンストラクタ引数
-- csv_path (str): CSVファイルパス
-- phase2idx (dict): フェーズマッピング
-- batch_size (int, default=8): バッチサイズ
-- num_workers (int, default=4): 並列ワーカー数
-- window_size (int, default=16): ウィンドウサイズ
-- stride (int, default=8): ストライド幅
-- max_frames (int, default=64): 最大フレーム数
+- npz_dir (str): npzファイルが保存されているディレクトリ
+- batch_size (int, default=32): バッチサイズ
+- num_workers (int, default=4): DataLoaderのワーカー数
+- val_split (float, default=0.2): 検証データの割合
 
 #### メソッド
 
 ##### setup(stage: Optional[str] = None)
 データセットの準備
-
-処理ステップ:
-1. CSVデータ読み込み
-2. トレーニング/検証データ分割（8:2）
-3. データセットインスタンス作成
+1. npzファイルの一覧取得
+2. train/val分割
+3. データセットインスタンス生成
 
 ##### train_dataloader()
 トレーニング用DataLoader生成
@@ -95,43 +56,64 @@ applyTo: "train.py"
 ##### val_dataloader()
 検証用DataLoader生成
 
-### SurgicalPhaseClassificationModel (nn.Module)
-手術フェーズ分類モデル
+### TransformerFeatureClassifier (nn.Module)
+特徴量をTransformerで統合し、分類を行うモデル
 
 #### コンストラクタ引数
+- feature_dim (int): 入力特徴量の次元数
 - num_classes (int): 分類クラス数
-
-#### コンポーネント
-1. 画像エンコーダ: maxvit_large_tf_224.in21k（事前学習済み）
-2. マスク特徴量変換: 線形層
-3. 特徴量統合: Multi-Head Attention
-4. 分類器: 全結合層（512次元中間層）
+- nhead (int, default=8): Multi-head Attentionのヘッド数
+- num_layers (int, default=3): Transformerレイヤー数
+- dim_feedforward (int, default=2048): フィードフォワード層の次元数
+- dropout (float, default=0.1): ドロップアウト率
 
 #### メソッド
 
-##### forward(image, mask)
+##### forward(features, mask_features)
 順伝播処理
+1. 特徴量の結合
+2. Transformer Encoderでの特徴量統合
+3. 分類層での予測
 
-処理ステップ:
-1. 画像特徴量抽出
-2. マスク特徴量変換
-3. Attention処理
-4. 分類器で予測
+### OphNetDataModule (pl.LightningDataModule)
+データセットの管理とデータローダーの構築を行うクラス
+
+#### コンストラクタ引数
+- npz_dir (str): npzファイルディレクトリ
+- batch_size (int, default=32): バッチサイズ
+- num_workers (int, default=4): 並列ワーカー数
+- val_split (float, default=0.2): 検証データの割合
+
+#### メソッド
+
+##### setup(stage: Optional[str] = None)
+データセットの準備
+1. npzファイルの一覧取得
+2. トレーニング/検証データ分割
+3. データセットインスタンス作成
+4. 特徴量モードの有効化
+
+##### train_dataloader()
+トレーニング用DataLoader生成
+
+##### val_dataloader()
+検証用DataLoader生成
 
 ### SurgicalPhaseModule (pl.LightningModule)
 学習プロセスを管理するLightningModule
 
 #### コンストラクタ引数
+- feature_dim (int): 入力特徴量の次元数
 - num_classes (int): 分類クラス数
-- class_weights (Optional[torch.Tensor]): クラス重み
-- lr (float, default=1e-4): 学習率
+- learning_rate (float, default=1e-4): 学習率
 
 #### メソッド
 
+##### forward(features, mask_features)
+モデルの順伝播処理
+
 ##### training_step(batch, batch_idx)
 1エポックの学習ステップ
-
-処理ステップ:
 1. バッチデータ取得
 2. モデル予測
 3. 損失計算
@@ -139,8 +121,6 @@ applyTo: "train.py"
 
 ##### validation_step(batch, batch_idx)
 1エポックの検証ステップ
-
-処理ステップ:
 1. バッチデータ取得
 2. モデル予測
 3. 損失と精度計算
@@ -153,8 +133,6 @@ applyTo: "train.py"
 
 ### calculate_class_weights(df, column)
 クラス重みの計算
-
-処理ステップ:
 1. クラス頻度カウント
 2. 逆頻度重み計算
 3. 最大値で正規化
@@ -162,36 +140,37 @@ applyTo: "train.py"
 ### main関数 (CLIコマンド)
 
 #### オプション
-- --csv_path (str, required): メタ情報CSV
-- --output_pth (str, default='model.ckpt'): モデル保存パス
-- --batch_size (int, default=8): バッチサイズ
+- --npz_dir (str, required): npzファイルディレクトリ
+- --output_dir (str, default='models'): モデル保存ディレクトリ
+- --batch_size (int, default=32): バッチサイズ
 - --num_workers (int, default=4): ワーカー数
+- --max_epochs (int, default=100): 最大エポック数
+- --feature_dim (int, default=1024): 特徴量の次元数
+- --learning_rate (float, default=1e-4): 学習率
 
 #### 処理ステップ
-1. CSVデータ読み込み
-2. フェーズマッピング作成
-3. クラス重み計算
-4. DataModule構築
-5. モデル初期化
-6. Trainer設定と学習実行
-7. モデル保存
+1. DataModuleの構築
+2. モデルの初期化
+3. WandbLoggerの設定
+4. Trainerの設定と学習実行
+5. モデル保存
 
 ## 実装上のポイント
 
 1. モデルアーキテクチャ
-   - 事前学習済みバックボーン
-   - マスク情報の効果的な統合
-   - Attention機構の活用
+   - Transformerベースのアーキテクチャ
+   - 特徴量の効果的な統合
+   - 柔軟な設定オプション
 
 2. 学習プロセス
-   - クラス不均衡への対応
    - 効率的なデータローディング
+   - Wandbによる実験管理
    - GPU活用の最適化
 
 3. エラー処理
-   - データロード時の例外処理
-   - ダミーデータによる学習継続
-   - エラーログ出力
+   - ファイル存在チェック
+   - データロードエラーの処理
+   - 適切なエラーメッセージ
 
 4. モジュール性
    - PyTorch Lightningによる整理
@@ -199,6 +178,6 @@ applyTo: "train.py"
    - 設定のカスタマイズ性
 
 5. 監視と可視化
-   - 損失と精度のログ記録
-   - 進捗バーでの表示
-   - チェックポイント保存
+   - Wandbによる実験ログ
+   - 学習進捗の可視化
+   - チェックポイント管理

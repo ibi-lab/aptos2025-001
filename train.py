@@ -11,94 +11,9 @@ import click
 from sklearn.model_selection import train_test_split
 from collections import Counter
 from typing import Optional
-
-# --- データセット定義 ---
-class OphNetSurgicalDataset(Dataset):
-    """
-    DataFrameの各行から動画パス・フェーズラベルを取得し、
-    動画ファイルから最大64フレームを読み込み、
-    pupil/instrumentマスクには画像そのもの（R/Gチャンネル）を使用。
-    SlidingWindowExtractorでウィンドウ抽出し、ランダムに1つ選択。
-    画像平均化・リサイズ・正規化・one-hotラベル化して返す。
-    """
-    def __init__(self, df, phase2idx, window_size=16, stride=8, max_frames=64):
-        self.df = df.reset_index(drop=True)
-        self.phase2idx = phase2idx
-        self.window_size = window_size
-        self.stride = stride
-        self.max_frames = max_frames
-        self.sw_extractor = SlidingWindowExtractor(window_size, stride)
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        video_path = row['video_path']
-        phase = row['phase']
-        try:
-            frames = self._read_video(video_path)
-            pupil_masks = [f[..., 0] for f in frames]
-            instrument_masks = [f[..., 1] for f in frames]
-            windows, mask_windows = self.sw_extractor.extract_windows(
-                frames, [np.stack([p, i], axis=0) for p, i in zip(pupil_masks, instrument_masks)])
-            idx_win = np.random.randint(0, len(windows))
-            window = windows[idx_win]
-            mask_window = mask_windows[idx_win]
-            img = window.mean(axis=0).astype(np.uint8)
-            mask = img.copy()
-            import cv2
-            img = cv2.resize(img, (224, 224))
-            mask = cv2.resize(mask, (224, 224))
-            img = img.transpose(2, 0, 1) / 255.0
-            mask = mask.transpose(2, 0, 1)
-            label = np.zeros(len(self.phase2idx), dtype=np.float32)
-            label[self.phase2idx[phase]] = 1.0
-            return {
-                'image': torch.tensor(img, dtype=torch.float32),
-                'mask': torch.tensor(mask, dtype=torch.float32),
-                'label': torch.tensor(label, dtype=torch.float32)
-            }
-        except Exception as e:
-            print(f"[ERROR] データ取得失敗: {video_path} ({e})")
-            # 例外時はダミーデータを返す（学習が止まらないように）
-            dummy = torch.zeros((3, 224, 224), dtype=torch.float32)
-            label = torch.zeros(len(self.phase2idx), dtype=torch.float32)
-            return {'image': dummy, 'mask': dummy, 'label': label}
-
-    def _read_video(self, video_path):
-        import cv2
-        cap = cv2.VideoCapture(video_path)
-        frames = []
-        while len(frames) < self.max_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        cap.release()
-        return frames
-
-class SlidingWindowExtractor:
-    """
-    動画フレーム列から指定サイズ・ストライドでウィンドウを抽出。
-    マスクがあれば同様にマスクウィンドウも抽出。
-    """
-    def __init__(self, window_size=16, stride=8):
-        self.window_size = window_size
-        self.stride = stride
-
-    def extract_windows(self, video_frames, masks=None):
-        windows = []
-        mask_windows = [] if masks is not None else None
-        num_frames = len(video_frames)
-        for start in range(0, num_frames - self.window_size + 1, self.stride):
-            end = start + self.window_size
-            windows.append(np.stack(video_frames[start:end]))
-            if masks is not None:
-                mask_windows.append(np.stack(masks[start:end]))
-        if masks is not None:
-            return np.array(windows), np.array(mask_windows)
-        return np.array(windows)
+import wandb
+from pytorch_lightning.loggers import WandbLogger
+from vdata import OphNetSurgicalDataset, SlidingWindowExtractor
 
 # --- DataModule ---
 class OphNetDataModule(pl.LightningDataModule):
@@ -107,27 +22,61 @@ class OphNetDataModule(pl.LightningDataModule):
     それぞれに対してOphNetSurgicalDatasetを構築するLightningDataModule。
     DataLoader生成・並列処理・メモリ最適化も担う。
     """
-    def __init__(self, csv_path, phase2idx, batch_size=8, num_workers=4, window_size=16, stride=8, max_frames=64):
+    def __init__(self, npz_dir, batch_size=32, num_workers=4, val_split=0.2):
         super().__init__()
-        self.csv_path = csv_path
-        self.phase2idx = phase2idx
+        self.npz_dir = npz_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.window_size = window_size
-        self.stride = stride
-        self.max_frames = max_frames
+        self.val_split = val_split
+        self.train_dataset = None
+        self.val_dataset = None
 
-    def setup(self, stage: Optional[str] = None):
-        df = pd.read_csv(self.csv_path)
-        train_df, val_df = train_test_split(df, test_size=0.2, stratify=df['phase'], random_state=42)
-        self.train_dataset = OphNetSurgicalDataset(train_df, self.phase2idx, self.window_size, self.stride, self.max_frames)
-        self.val_dataset = OphNetSurgicalDataset(val_df, self.phase2idx, self.window_size, self.stride, self.max_frames)
+    def setup(self, stage=None):
+        # .npzファイルの一覧を取得
+        npz_files = glob.glob(os.path.join(self.npz_dir, "*.npz"))
+        if not npz_files:
+            raise ValueError(f"No .npz files found in {self.npz_dir}")
+
+        # train/val分割
+        train_files, val_files = train_test_split(
+            npz_files, test_size=self.val_split, random_state=42
+        )
+
+        # データセットの作成
+        self.train_dataset = OphNetSurgicalDataset.load_npz(train_files[0])  # 最初の特徴量を取得してサイズを確認
+        # 残りのデータセットを追加
+        for npz_file in tqdm(train_files[1:], desc="Loading training datasets"):
+            dataset = OphNetSurgicalDataset.load_npz(npz_file)
+            if dataset is not None:
+                self.train_dataset.extend(dataset)
+
+        self.val_dataset = OphNetSurgicalDataset.load_npz(val_files[0])
+        for npz_file in tqdm(val_files[1:], desc="Loading validation datasets"):
+            dataset = OphNetSurgicalDataset.load_npz(npz_file)
+            if dataset is not None:
+                self.val_dataset.extend(dataset)
+
+        # 特徴量モードを有効化
+        self.train_dataset.return_features = True
+        self.val_dataset.return_features = True
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True
+        )
 
 # --- モデル定義 ---
 class SurgicalPhaseClassificationModel(nn.Module):
@@ -156,38 +105,120 @@ class SurgicalPhaseClassificationModel(nn.Module):
         out = self.fc(attn_out.squeeze(1))
         return out
 
+# --- Transformerベースのモデル定義 ---
+class TransformerFeatureClassifier(nn.Module):
+    """
+    特徴量をTransformerで統合し、分類を行うモデル
+    """
+    def __init__(self, feature_dim, num_classes, nhead=8, num_layers=3, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        
+        # 特徴量の次元を調整する線形層
+        self.feature_proj = nn.Linear(feature_dim, dim_feedforward)
+        self.mask_feature_proj = nn.Linear(feature_dim, dim_feedforward)
+        
+        # Transformerエンコーダ
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim_feedforward,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 分類ヘッド
+        self.classifier = nn.Sequential(
+            nn.Linear(dim_feedforward, dim_feedforward // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward // 2, num_classes)
+        )
+    
+    def forward(self, features, mask_features):
+        # 特徴量の次元を調整
+        x1 = self.feature_proj(features)
+        x2 = self.mask_feature_proj(mask_features)
+        
+        # 特徴量を結合 [batch_size, 2, dim_feedforward]
+        x = torch.stack([x1, x2], dim=1)
+        
+        # Transformerで特徴統合
+        x = self.transformer(x)
+        
+        # 系列の平均を取って分類
+        x = x.mean(dim=1)
+        return self.classifier(x)
+
 # --- LightningModule ---
 class SurgicalPhaseModule(pl.LightningModule):
     """
-    PyTorch LightningのLightningModule。
-    モデル・損失・最適化・学習/検証ループ・メトリクス管理。
+    学習プロセスを管理するLightningModule
     """
-    def __init__(self, num_classes, class_weights=None, lr=1e-4):
+    def __init__(self, feature_dim, num_classes, learning_rate=1e-4):
         super().__init__()
-        self.model = SurgicalPhaseClassificationModel(num_classes)
-        self.lr = lr
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
-
+        self.save_hyperparameters()
+        self.model = TransformerFeatureClassifier(feature_dim, num_classes)
+        self.learning_rate = learning_rate
+        self.criterion = nn.CrossEntropyLoss()
+        
+        # WandB用のメトリクス初期化
+        self.train_acc = torchmetrics.Accuracy(task='multiclass', num_classes=num_classes)
+        self.val_acc = torchmetrics.Accuracy(task='multiclass', num_classes=num_classes)
+    
+    def forward(self, features, mask_features):
+        return self.model(features, mask_features)
+    
     def training_step(self, batch, batch_idx):
-        x, m, y = batch['image'], batch['mask'], batch['label']
-        logits = self.model(x, m)
-        loss = self.criterion(logits, y.argmax(dim=1))
-        self.log('train_loss', loss)
+        features = batch['features']
+        mask_features = batch['mask_features']
+        labels = batch['label']
+        
+        # モデルの予測
+        logits = self(features, mask_features)
+        loss = self.criterion(logits, labels.argmax(dim=1))
+        
+        # メトリクスの計算
+        preds = torch.argmax(logits, dim=1)
+        acc = self.train_acc(preds, labels.argmax(dim=1))
+        
+        # WandBへのログ記録
+        self.log('train_loss', loss, on_step=True, on_epoch=True)
+        self.log('train_acc', acc, on_step=True, on_epoch=True)
+        
         return loss
-
+    
     def validation_step(self, batch, batch_idx):
-        x, m, y = batch['image'], batch['mask'], batch['label']
-        logits = self.model(x, m)
-        loss = self.criterion(logits, y.argmax(dim=1))
-        preds = logits.argmax(dim=1)
-        targets = y.argmax(dim=1)
-        acc = (preds == targets).float().mean()
-        self.log('val_loss', loss, prog_bar=True)
-        self.log('val_acc', acc, prog_bar=True)
-        return {'val_loss': loss, 'val_acc': acc}
-
+        features = batch['features']
+        mask_features = batch['mask_features']
+        labels = batch['label']
+        
+        # モデルの予測
+        logits = self(features, mask_features)
+        loss = self.criterion(logits, labels.argmax(dim=1))
+        
+        # メトリクスの計算
+        preds = torch.argmax(logits, dim=1)
+        acc = self.val_acc(preds, labels.argmax(dim=1))
+        
+        # WandBへのログ記録
+        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
+        self.log('val_acc', acc, on_epoch=True, prog_bar=True)
+        
+        return loss
+    
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss"
+            }
+        }
 
 # --- クラス重み計算 ---
 def calculate_class_weights(df, column):
@@ -201,29 +232,176 @@ def calculate_class_weights(df, column):
     norm_weights = {k: v/max_weight for k, v in weights.items()}
     return torch.tensor([norm_weights[k] for k in sorted(norm_weights.keys())], dtype=torch.float32)
 
+# --- NPZデータセット定義 ---
+class NPZFeatureDataset(Dataset):
+    """
+    vdata.pyで生成されたnpzファイルから特徴量とラベルを読み込むデータセット
+    """
+    def __init__(self, npz_files):
+        self.npz_files = npz_files
+        self.datasets = [OphNetSurgicalDataset.load_npz(f) for f in npz_files]
+        self.cumulative_lengths = np.cumsum([len(d) for d in self.datasets])
+    
+    def __len__(self):
+        return self.cumulative_lengths[-1]
+    
+    def __getitem__(self, idx):
+        # データセットのインデックスを特定
+        dataset_idx = np.searchsorted(self.cumulative_lengths, idx, side='right')
+        if dataset_idx == 0:
+            sample_idx = idx
+        else:
+            sample_idx = idx - self.cumulative_lengths[dataset_idx - 1]
+        
+        # 対応するデータセットからサンプルを取得
+        dataset = self.datasets[dataset_idx]
+        dataset.return_features = True  # 特徴量モードを有効化
+        sample = dataset[sample_idx]
+        
+        return {
+            'features': sample['features'],
+            'mask_features': sample['mask_features'],
+            'label': sample['label']
+        }
+
+class NPZDataModule(pl.LightningDataModule):
+    """
+    npzファイルを管理し、トレーニング/検証用のDataLoaderを提供するDataModule
+    """
+    def __init__(self, npz_dir, batch_size=32, num_workers=4, val_split=0.2):
+        super().__init__()
+        self.npz_dir = npz_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.val_split = val_split
+
+    def setup(self, stage=None):
+        # npzファイルのリストを取得
+        npz_files = sorted(glob.glob(os.path.join(self.npz_dir, "*.npz")))
+        if not npz_files:
+            raise ValueError(f"No npz files found in {self.npz_dir}")
+        
+        # トレーニング/検証用にファイルを分割
+        train_files, val_files = train_test_split(
+            npz_files, test_size=self.val_split, random_state=42
+        )
+        
+        # データセットの作成
+        self.train_dataset = NPZFeatureDataset(train_files)
+        self.val_dataset = NPZFeatureDataset(val_files)
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True
+        )
+
 # --- メイン処理 ---
 @click.command()
-@click.option('--csv_path', type=str, required=True, help='動画メタ情報CSV（video_path, phase列必須）')
-@click.option('--output_pth', type=str, default='model.ckpt', help='モデル保存パス')
-@click.option('--batch_size', type=int, default=8, help='バッチサイズ')
-@click.option('--num_workers', type=int, default=4, help='DataLoaderのワーカ数')
-def main(csv_path, output_pth, batch_size, num_workers):
+@click.option('--npz_dir', type=str, required=True, help='npzファイルが保存されているディレクトリ')
+@click.option('--output_dir', type=str, default='models', help='モデル保存ディレクトリ')
+@click.option('--batch_size', type=int, default=32, help='バッチサイズ')
+@click.option('--num_workers', type=int, default=4, help='DataLoaderのワーカー数')
+@click.option('--max_epochs', type=int, default=100, help='最大エポック数')
+@click.option('--feature_dim', type=int, default=1024, help='特徴量の次元数')
+@click.option('--learning_rate', type=float, default=1e-4, help='学習率')
+def main(npz_dir, output_dir, batch_size, num_workers, max_epochs, feature_dim, learning_rate):
     """
-    データセットCSVを読み込み、OphNetDataModule/モデル/Trainerを構築し学習・保存。
+    npzファイルからTransformerベースの分類モデルを学習し、WandBで進捗を管理します。
     """
     try:
-        df = pd.read_csv(csv_path)
-        phases = sorted(df['phase'].unique())
-        phase2idx = {p: i for i, p in enumerate(phases)}
-        class_weights = calculate_class_weights(df, 'phase')
-        datamodule = OphNetDataModule(csv_path, phase2idx, batch_size, num_workers)
-        model = SurgicalPhaseModule(num_classes=len(phases), class_weights=class_weights)
-        trainer = pl.Trainer(max_epochs=30, accelerator='auto', devices=1, log_every_n_steps=10)
+        # 出力ディレクトリの作成
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # WandBの初期化
+        wandb.init(
+            project="ophnet-phase-classification",
+            config={
+                "batch_size": batch_size,
+                "max_epochs": max_epochs,
+                "feature_dim": feature_dim,
+                "learning_rate": learning_rate,
+            }
+        )
+        
+        # データモジュールの準備
+        datamodule = NPZDataModule(
+            npz_dir=npz_dir,
+            batch_size=batch_size,
+            num_workers=num_workers
+        )
+        
+        # サンプルデータからクラス数を取得
+        datamodule.setup()
+        num_classes = datamodule.train_dataset.datasets[0].labels.shape[1]
+        
+        # モデルの初期化
+        model = SurgicalPhaseModule(
+            feature_dim=feature_dim,
+            num_classes=num_classes,
+            learning_rate=learning_rate
+        )
+        
+        # コールバックの設定
+        callbacks = [
+            pl.callbacks.ModelCheckpoint(
+                dirpath=output_dir,
+                filename='best-{epoch:02d}-{val_loss:.2f}',
+                monitor='val_loss',
+                mode='min',
+                save_top_k=3
+            ),
+            pl.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=10,
+                mode='min'
+            ),
+            pl.callbacks.LearningRateMonitor(logging_interval='step'),
+            WandbLogger()
+        ]
+        
+        # トレーナーの設定と学習の実行
+        trainer = pl.Trainer(
+            max_epochs=max_epochs,
+            accelerator='auto',
+            devices=1,
+            callbacks=callbacks,
+            log_every_n_steps=10,
+            deterministic=True
+        )
+        
+        # 学習の実行
         trainer.fit(model, datamodule=datamodule)
-        trainer.save_checkpoint(output_pth)
-        print(f"モデルを {output_pth} に保存しました")
+        
+        # 最終モデルの保存
+        final_model_path = os.path.join(output_dir, 'final_model.ckpt')
+        trainer.save_checkpoint(final_model_path)
+        
+        # WandBにモデルを記録
+        artifact = wandb.Artifact('model', type='model')
+        artifact.add_file(final_model_path)
+        wandb.log_artifact(artifact)
+        
+        print(f"Training completed. Final model saved to {final_model_path}")
+        
     except Exception as e:
-        print(f"[ERROR] 学習処理失敗: {e}")
+        print(f"[ERROR] Training failed: {e}")
+        raise
+    finally:
+        # WandBのクリーンアップ
+        wandb.finish()
 
 if __name__ == '__main__':
     main()
