@@ -13,7 +13,7 @@ applyTo: "vdata.py"
 1. ファイル名からメタ情報を抽出してデータフレーム化
 2. 各動画を読み込んで、以下の形式のデータを生成
    - images: nframe, height, width, 3の形状を持つRGB画像群
-   - masks: nframe, height, width, 3の形状を持つマスク画像群
+   - masks: nframe, height, width, 3の形状を持つマスク画像群（pupil部と手術器具の銀色部分を抽出）
    - features: 画像特徴量（maxvit_large_tf_224.in21k特徴量）
    - mask_features: マスク特徴量（同上）
    - label: one-hotラベル（手術フェーズのインデックス）
@@ -175,7 +175,7 @@ npzファイルからデータセットを読み込むクラスメソッド
 
 引数:
 - video_dir (str): 動画フォルダパス
-- output_pth (str): 出力pthファイルパス
+- output_pth (str): 保存先pthファイルパス
 - intermediate_pth (str, optional): 中間ファイル保存先ディレクトリ
 - skip_existing (bool): 既存ファイルをスキップするかどうか
 - n_jobs (int): 並列ジョブ数
@@ -235,3 +235,51 @@ CLIエントリポイント
    - 豊富なログ出力
    - モジュール化された設計
    - 詳細なドキュメンテーション
+
+## ユーティリティ関数
+
+### extract_pupil_mask(frame)
+瞳孔（暗い円形領域）を抽出してマスクを生成する関数
+
+引数:
+- frame (np.ndarray): 入力フレーム（BGR形式）
+
+処理ステップ:
+1. グレースケール変換
+2. ガウシアンブラーでノイズ除去 (kernel_size=(9,9), sigma=2)
+3. 適応的閾値処理で暗い領域を抽出
+4. モルフォロジー演算（Opening, Closing）でノイズ除去と領域の整形
+
+戻り値:
+- np.ndarray: 瞳孔のマスク（バイナリ）
+
+### extract_instruments_mask(frame)
+手術器具の銀色部分を抽出してマスクを生成する関数
+
+引数:
+- frame (np.ndarray): 入力フレーム（BGR形式）
+
+処理ステップ:
+1. HSV色空間に変換
+2. 低彩度・高明度領域を抽出（銀色の特徴）
+   - lower = [0, 0, 100]
+   - upper = [180, 30, 255]
+3. モルフォロジー演算でノイズ除去と領域の整形
+
+戻り値:
+- np.ndarray: 器具のマスク（バイナリ）
+
+### generate_combined_mask(frame)
+瞳孔と手術器具のマスクを組み合わせて最終的なマスクを生成する関数
+
+引数:
+- frame (np.ndarray): 入力フレーム（BGR形式）
+
+処理ステップ:
+1. 瞳孔マスクを生成（extract_pupil_mask）
+2. 器具マスクを生成（extract_instruments_mask）
+3. OR演算でマスクを統合
+4. マスクを3チャンネルに拡張（BGR形式）
+
+戻り値:
+- np.ndarray: 結合されたマスク（BGR形式）

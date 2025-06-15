@@ -23,6 +23,90 @@ from joblib import Parallel, delayed
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
+import cv2
+import numpy as np
+
+def extract_pupil_mask(frame):
+    """
+    瞳孔（暗い円形領域）を抽出してマスクを生成する
+
+    Args:
+        frame (np.ndarray): 入力フレーム（BGR形式）
+
+    Returns:
+        np.ndarray: 瞳孔のマスク（バイナリ）
+    """
+    # グレースケール変換
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # ガウシアンブラーでノイズ除去
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+    
+    # 適応的閾値処理で暗い領域を抽出
+    thresh = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        11,
+        2
+    )
+    
+    # モルフォロジー演算でノイズ除去と領域の整形
+    kernel = np.ones((5,5), np.uint8)
+    mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    
+    return mask
+
+def extract_instruments_mask(frame):
+    """
+    手術器具の銀色部分を抽出してマスクを生成する
+
+    Args:
+        frame (np.ndarray): 入力フレーム（BGR形式）
+
+    Returns:
+        np.ndarray: 器具のマスク（バイナリ）
+    """
+    # HSV色空間に変換
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    # 低彩度・高明度の領域を抽出（銀色の特徴）
+    lower = np.array([0, 0, 100])  # 低彩度、高明度の閾値
+    upper = np.array([180, 30, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    
+    # モルフォロジー演算でノイズ除去と領域の整形
+    kernel = np.ones((5,5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    
+    return mask
+
+def generate_combined_mask(frame):
+    """
+    瞳孔と手術器具のマスクを組み合わせて最終的なマスクを生成する
+
+    Args:
+        frame (np.ndarray): 入力フレーム（BGR形式）
+
+    Returns:
+        np.ndarray: 結合されたマスク（バイナリ）
+    """
+    # 瞳孔マスクと器具マスクを生成
+    pupil_mask = extract_pupil_mask(frame)
+    instruments_mask = extract_instruments_mask(frame)
+    
+    # マスクを組み合わせる（OR演算）
+    combined_mask = cv2.bitwise_or(pupil_mask, instruments_mask)
+    
+    # マスクを3チャンネルに拡張（元の画像と同じ形状に）
+    combined_mask = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
+    
+    return combined_mask
+
+
 class SlidingWindowExtractor:
     """
     動画フレーム列からウィンドウを抽出するクラス。
@@ -141,7 +225,7 @@ class OphNetSurgicalDataset(Dataset):
 
     @classmethod
     def create_from_video(cls, video_path, phase, phase2idx, window_size=16, stride=4, 
-                     skip_generate_masks=True, max_frames=128, extract_features=True, 
+                     skip_generate_masks=False, max_frames=128, extract_features=True, 
                      return_features=True, device='cuda'):
         """
         動画ファイルからデータセットを生成します
@@ -190,7 +274,7 @@ class OphNetSurgicalDataset(Dataset):
             # マスクの生成（オプション）
             mask_chunks = None
             if not skip_generate_masks:
-                masks = [generate_mask(frame) for frame in frames]
+                masks = [generate_combined_mask(frame) for frame in frames]
                 mask_chunks = extractor.extract_windows(masks)
 
             # ラベルの準備
@@ -529,3 +613,4 @@ def cli(video_dir, output_pth, intermediate_pth, skip_existing, n_jobs, n_sample
 
 if __name__ == '__main__':
     cli()
+

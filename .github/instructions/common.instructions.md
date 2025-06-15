@@ -34,18 +34,31 @@ graph TD
     subgraph "データ準備 (vdata.py)"
         A[動画ファイル] --> B[メタ情報抽出]
         B --> C[フレーム抽出]
-        C --> D[ウィンドウ化]
-        D --> E[特徴量抽出]
-        E --> F[npzファイル保存]
+
+        subgraph "マスク生成"
+            C --> D1[瞳孔抽出]
+            C --> D2[器具抽出]
+            D1 --> D3[マスク統合]
+            D2 --> D3
+        end
+
+        C --> E1[フレームのウィンドウ化]
+        D3 --> E2[マスクのウィンドウ化]
+        
+        E1 --> F1[画像特徴量抽出]
+        E2 --> F2[マスク特徴量抽出]
+        
+        F1 --> G[npzファイル保存]
+        F2 --> G
     end
 
     subgraph "学習 (train.py)"
-        F --> G[npzファイル読み込み]
-        G --> H[データセット分割]
-        H --> I[Transformerモデル構築]
-        I --> J[PyTorch Lightning学習]
-        J --> K[モデル保存]
-        J --> L[ログ記録]
+        G --> H[npzファイル読み込み]
+        H --> I[データセット分割]
+        I --> J[Transformerモデル構築]
+        J --> K[PyTorch Lightning学習]
+        K --> L[モデル保存]
+        K --> M[ログ記録]
     end
 
     subgraph "可視化・評価 (view.py)"

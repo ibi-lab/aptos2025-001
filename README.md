@@ -21,18 +21,31 @@ graph TD
     subgraph "データ準備 (vdata.py)"
         A[動画ファイル] --> B[メタ情報抽出]
         B --> C[フレーム抽出]
-        C --> D[ウィンドウ化]
-        D --> E[特徴量抽出]
-        E --> F[npzファイル保存]
+
+        subgraph "マスク生成"
+            C --> D1[瞳孔抽出]
+            C --> D2[器具抽出]
+            D1 --> D3[マスク統合]
+            D2 --> D3
+        end
+
+        C --> E1[フレームのウィンドウ化]
+        D3 --> E2[マスクのウィンドウ化]
+        
+        E1 --> F1[画像特徴量抽出]
+        E2 --> F2[マスク特徴量抽出]
+        
+        F1 --> G[npzファイル保存]
+        F2 --> G
     end
 
     subgraph "学習 (train.py)"
-        F --> G[npzファイル読み込み]
-        G --> H[データセット分割]
-        H --> I[Transformerモデル構築]
-        I --> J[PyTorch Lightning学習]
-        J --> K[モデル保存]
-        J --> L[ログ記録]
+        G --> H[npzファイル読み込み]
+        H --> I[データセット分割]
+        I --> J[Transformerモデル構築]
+        J --> K[PyTorch Lightning学習]
+        K --> L[モデル保存]
+        K --> M[ログ記録]
     end
 ```
 
@@ -40,6 +53,9 @@ graph TD
 
 ### 1. データ処理 (`vdata.py`)
 - 手術動画からの画像・マスク抽出
+  - 瞳孔部分の抽出（グレースケール変換→ブラー→適応的閾値処理）
+  - 手術器具の銀色部分の抽出（HSV変換→低彩度高明度領域抽出）
+  - マスクの統合（OR演算）
 - 特徴量抽出（maxvit_large_tf_224.in21k）
 - スライディングウィンドウによるフレーム処理
 - 中間データの保存（.npz形式）
@@ -220,3 +236,49 @@ python view.py show-prediction \
 3. メモリ管理
    - 大量のデータを扱う場合は`batch_size`と`num_workers`を調整
    - 必要に応じて`max_frames`オプションでフレーム数を制限
+
+## プロジェクト構造
+
+### 実装指示書
+
+プロジェクトの詳細な実装仕様は以下の指示書に記載されています：
+
+1. [共通実装指示書](.github/instructions/common.instructions.md)
+   - プロジェクト全体の処理フロー
+   - 依存パッケージの管理方法
+   - コード規約とベストプラクティス
+
+2. コンポーネント別実装指示書
+   - [データ処理モジュール (vdata.py)](.github/instructions/vdata.instructions.md)
+     - 動画処理とデータセット生成
+     - マスク生成アルゴリズム
+     - 特徴量抽出プロセス
+   - [学習モジュール (train.py)](.github/instructions/train.instructions.md)
+     - モデルアーキテクチャ
+     - 学習プロセス
+     - 実験管理
+   - [可視化モジュール (view.py)](.github/instructions/view.instructions.md)
+     - データ可視化機能
+     - 結果分析ツール
+     - デバッグ支援機能
+
+各指示書には、実装の詳細な仕様、設計の意図、および保守のガイドラインが記載されています。
+
+### ディレクトリ構造
+
+```
+.
+├── README.md              # プロジェクト概要
+├── vdata.py              # データ処理モジュール
+├── train.py             # 学習モジュール
+├── view.py              # 可視化モジュール
+├── requirements.txt     # 依存パッケージ一覧
+├── .github
+│   └── instructions     # 実装指示書
+│       ├── common.instructions.md
+│       ├── vdata.instructions.md
+│       ├── train.instructions.md
+│       └── view.instructions.md
+├── models/             # 学習済みモデル
+└── vdata_mediate/     # 中間データファイル
+```
